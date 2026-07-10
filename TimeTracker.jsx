@@ -121,4 +121,5 @@ export default function TimeTracker() {
     const next = entries.map((e) => (e.id === activeId ? { ...e, end: new Date().toISOString() } : e));
     persist(next);
     setActiveId(null);
-    setStatus("idle
+    setStatus("idle");
+
