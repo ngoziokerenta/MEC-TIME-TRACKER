@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useCallback } from "react";
-import { Play, Coffee, Square, GraduationCap, Clock, X } from "lucide-react";
+import { Play, Coffee, Square, GraduationCap, Clock, X, Trash2 } from "lucide-react";
 import { initializeApp } from "firebase/app";
 import { getDatabase, ref, get, set } from "firebase/database";
 
@@ -59,11 +59,12 @@ export default function TimeTracker() {
   const [coachName, setCoachName] = useState("");
   const [showCoachModal, setShowCoachModal] = useState(false);
   const [loading, setLoading] = useState(true);
+  const [refreshKey, setRefreshKey] = useState(0);
   const [selectedDate, setSelectedDate] = useState(todayKey());
   const dateKey = selectedDate;
 
   useEffect(() => {
-    const t = setInterval(() => {}, 1000);
+    const t = setInterval(() => setRefreshKey(k => k + 1), 1000);
     return () => clearInterval(t);
   }, []);
 
@@ -101,6 +102,11 @@ export default function TimeTracker() {
     },
     [dateKey]
   );
+
+  const deleteEntry = (id) => {
+    const next = entries.filter((e) => e.id !== id);
+    persist(next);
+  };
 
   const activeEntry = entries.find((e) => e.id === activeId && !e.end);
 
@@ -175,7 +181,7 @@ export default function TimeTracker() {
           <div style={{ fontSize: 13, color: COLORS.slate, marginTop: 6 }}>{new Date(selectedDate + "T00:00:00").toLocaleDateString(undefined, { weekday: "long", month: "long", day: "numeric" })}</div>
         </div>
 
-        <div style={{ background: `linear-gradient(135deg, ${COLORS.purple}, ${COLORS.plum})`, borderRadius: 20, padding: "24px 22px", color: "white", marginBottom: 16, boxShadow: "0 8px 24px rgba(54,11,92,0.25)" }}>
+        <div style={{ background: `linear-gradient(135deg, ${COLORS.purple}, ${COLORS.plum})`, borderRadius: 20, padding: "24px 22px", color: "white", marginBottom: 16, boxShadow: "0 8px 24px rgba(54,11,92,0.25)" }} key={refreshKey}>
           <div style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12, opacity: 0.85, textTransform: "uppercase", letterSpacing: 1 }}>
             <Clock size={14} />
             {loading ? "Loading…" : clockInTime ? `Clocked in at ${clockInTime}` : "No activity yet today"}
@@ -196,7 +202,7 @@ export default function TimeTracker() {
         )}
 
         {entries.length > 0 && (
-          <div style={{ marginBottom: 16 }}>
+          <div style={{ marginBottom: 16 }} key={`timeline-${refreshKey}`}>
             <div style={{ fontSize: 12, color: COLORS.slate, marginBottom: 6, fontWeight: 600 }}>TIMELINE</div>
             <div style={{ display: "flex", height: 14, borderRadius: 8, overflow: "hidden", background: COLORS.lavender }}>
               {entries.map((e) => {
@@ -216,7 +222,7 @@ export default function TimeTracker() {
         )}
 
         <div style={{ fontSize: 12, color: COLORS.slate, marginBottom: 6, fontWeight: 600 }}>ENTRIES</div>
-        <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+        <div style={{ display: "flex", flexDirection: "column", gap: 8 }} key={`entries-${refreshKey}`}>
           {entries.length === 0 && !loading && <div style={{ fontSize: 13, color: COLORS.slate, background: COLORS.lavender, borderRadius: 12, padding: 16, textAlign: "center" }}>No entries yet. Clock in to start your day.</div>}
           {[...entries].reverse().map((e) => {
             const startTime = new Date(e.start).getTime();
@@ -224,11 +230,18 @@ export default function TimeTracker() {
             const dur = Math.max(0, endTime - startTime);
             return (
               <div key={e.id} style={{ background: "white", border: `1px solid ${COLORS.lavender}`, borderLeft: `4px solid ${SEGMENT_COLOR[e.type]}`, borderRadius: 10, padding: "10px 14px", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-                <div>
+                <div style={{ flex: 1 }}>
                   <div style={{ fontSize: 14, fontWeight: 600 }}>{e.type === "coaching" ? `Coaching — ${e.coachee}` : SEGMENT_LABEL[e.type]}</div>
                   <div style={{ fontSize: 12, color: COLORS.slate }}>{fmtTime(e.start)} – {e.end ? fmtTime(e.end) : "now"}</div>
                 </div>
-                <div style={{ fontSize: 13, fontWeight: 600, color: e.end ? COLORS.slate : SEGMENT_COLOR[e.type] }}>{fmtDuration(dur)}{!e.end && " ●"}</div>
+                <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                  <div style={{ fontSize: 13, fontWeight: 600, color: e.end ? COLORS.slate : SEGMENT_COLOR[e.type], minWidth: 60, textAlign: "right" }}>{fmtDuration(dur)}{!e.end && " ●"}</div>
+                  {selectedDate === todayKey() && (
+                    <button onClick={() => deleteEntry(e.id)} style={{ background: "none", border: "none", color: COLORS.slate, cursor: "pointer", padding: "4px", display: "flex", alignItems: "center" }}>
+                      <Trash2 size={16} />
+                    </button>
+                  )}
+                </div>
               </div>
             );
           })}
@@ -260,3 +273,4 @@ function ActionButton({ icon, label, onClick, disabled, color }) {
     </button>
   );
 }
+
