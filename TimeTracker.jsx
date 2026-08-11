@@ -2,6 +2,7 @@ import React, { useState, useEffect, useCallback } from "react";
 import { Play, Coffee, Square, GraduationCap, Clock, X, Trash2 } from "lucide-react";
 import { initializeApp } from "firebase/app";
 import { getDatabase, ref, get, set } from "firebase/database";
+import { getAuth, signInAnonymously, onAuthStateChanged } from "firebase/auth";
 
 const COLORS = {
   purple: "#360B5C",
@@ -35,6 +36,7 @@ const firebaseConfig = {
 
 const app = initializeApp(firebaseConfig);
 const database = getDatabase(app);
+const auth = getAuth(app);
 
 function todayKey(d = new Date()) {
   return d.toISOString().slice(0, 10);
@@ -59,6 +61,7 @@ export default function TimeTracker() {
   const [coachName, setCoachName] = useState("");
   const [showCoachModal, setShowCoachModal] = useState(false);
   const [loading, setLoading] = useState(true);
+  const [authReady, setAuthReady] = useState(false);
   const [refreshKey, setRefreshKey] = useState(0);
   const [selectedDate, setSelectedDate] = useState(todayKey());
   const dateKey = selectedDate;
@@ -69,6 +72,18 @@ export default function TimeTracker() {
   }, []);
 
   useEffect(() => {
+    const unsubscribe = onAuthStateChanged(auth, (user) => {
+      if (user) {
+        setAuthReady(true);
+      } else {
+        signInAnonymously(auth).catch((e) => console.error("Auth error", e));
+      }
+    });
+    return () => unsubscribe();
+  }, []);
+
+  useEffect(() => {
+    if (!authReady) return;
     (async () => {
       try {
         const dbRef = ref(database, `entries/${dateKey}`);
@@ -88,7 +103,7 @@ export default function TimeTracker() {
         setLoading(false);
       }
     })();
-  }, [dateKey]);
+  }, [dateKey, authReady]);
 
   const persist = useCallback(
     async (next) => {
@@ -273,4 +288,3 @@ function ActionButton({ icon, label, onClick, disabled, color }) {
     </button>
   );
 }
-
