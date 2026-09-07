@@ -1,8 +1,7 @@
-import React, { useState, useEffect, useCallback } from "react";
+import React, { useState, useEffect, useCallback, useRef } from "react";
 import { Play, Coffee, Square, GraduationCap, Clock, X, Trash2 } from "lucide-react";
 import { initializeApp } from "firebase/app";
 import { getDatabase, ref, get, set } from "firebase/database";
-import { getAuth, signInAnonymously, onAuthStateChanged } from "firebase/auth";
 
 const COLORS = {
   purple: "#360B5C",
@@ -36,7 +35,6 @@ const firebaseConfig = {
 
 const app = initializeApp(firebaseConfig);
 const database = getDatabase(app);
-const auth = getAuth(app);
 
 function todayKey(d = new Date()) {
   return d.toISOString().slice(0, 10);
@@ -54,36 +52,60 @@ function fmtDuration(ms) {
   return `${h}h ${m}m`;
 }
 
+function effectiveEnd(entry, dateKey, currentTime) {
+  if (entry.end) return new Date(entry.end).getTime();
+  if (dateKey === todayKey()) return currentTime;
+  return new Date(dateKey + "T23:59:59").getTime();
+}
+
+async function writeDayEntries(day, entriesArr) {
+  try {
+    const dbRef = ref(database, `entries/${day}`);
+    await set(dbRef, entriesArr);
+  } catch (err) {
+    console.error("Firebase write error", err);
+  }
+}
+
 export default function TimeTracker() {
   const [entries, setEntries] = useState([]);
   const [status, setStatus] = useState("idle");
   const [activeId, setActiveId] = useState(null);
   const [coachName, setCoachName] = useState("");
   const [showCoachModal, setShowCoachModal] = useState(false);
+  const [showMidnightPrompt, setShowMidnightPrompt] = useState(false);
   const [loading, setLoading] = useState(true);
-  const [authReady, setAuthReady] = useState(false);
   const [refreshKey, setRefreshKey] = useState(0);
   const [selectedDate, setSelectedDate] = useState(todayKey());
   const dateKey = selectedDate;
 
+  const activeEntry = entries.find((e) => e.id === activeId && !e.end);
+
+  const activeEntryRef = useRef(null);
+  const entriesRef = useRef([]);
+  const promptedRef = useRef(false);
+  const autoCloseTimerRef = useRef(null);
+  const selectedDateRef = useRef(selectedDate);
+  const isLiveRef = useRef(true);
+
   useEffect(() => {
-    const t = setInterval(() => setRefreshKey(k => k + 1), 1000);
+    activeEntryRef.current = activeEntry;
+  }, [activeEntry]);
+
+  useEffect(() => {
+    entriesRef.current = entries;
+  }, [entries]);
+
+  useEffect(() => {
+    selectedDateRef.current = selectedDate;
+  }, [selectedDate]);
+
+  useEffect(() => {
+    const t = setInterval(() => setRefreshKey((k) => k + 1), 1000);
     return () => clearInterval(t);
   }, []);
 
   useEffect(() => {
-    const unsubscribe = onAuthStateChanged(auth, (user) => {
-      if (user) {
-        setAuthReady(true);
-      } else {
-        signInAnonymously(auth).catch((e) => console.error("Auth error", e));
-      }
-    });
-    return () => unsubscribe();
-  }, []);
-
-  useEffect(() => {
-    if (!authReady) return;
     (async () => {
       try {
         const dbRef = ref(database, `entries/${dateKey}`);
@@ -91,10 +113,13 @@ export default function TimeTracker() {
         const data = snapshot.exists() ? snapshot.val() : [];
         setEntries(data);
         const active = data.find((e) => !e.end);
-        if (active) {
+        if (active && dateKey === todayKey()) {
           setStatus(active.type === "break" ? "break" : active.type === "coaching" ? "coaching" : "working");
           setActiveId(active.id);
           if (active.coachee) setCoachName(active.coachee);
+        } else {
+          setStatus("idle");
+          setActiveId(null);
         }
       } catch (e) {
         console.error("Firebase load error", e);
@@ -103,7 +128,7 @@ export default function TimeTracker() {
         setLoading(false);
       }
     })();
-  }, [dateKey, authReady]);
+  }, [dateKey]);
 
   const persist = useCallback(
     async (next) => {
@@ -121,22 +146,39 @@ export default function TimeTracker() {
   const deleteEntry = (id) => {
     const next = entries.filter((e) => e.id !== id);
     persist(next);
+    if (id === activeId) {
+      setActiveId(null);
+      setStatus("idle");
+    }
   };
 
-  const activeEntry = entries.find((e) => e.id === activeId && !e.end);
-
-  function startSegment(type, coachee) {
-    const id = `${Date.now()}`;
-    const entry = { id, type, start: new Date().toISOString(), end: null, ...(coachee ? { coachee } : {}) };
-    const next = [...entries, entry];
-    persist(next);
-    setActiveId(id);
-    setStatus(type === "break" ? "break" : type === "coaching" ? "coaching" : "working");
+  function requestNotificationPermission() {
+    if (typeof Notification !== "undefined" && Notification.permission === "default") {
+      Notification.requestPermission();
+    }
   }
 
-  function endSegment() {
+  function switchSegment(newType, coachee) {
+    requestNotificationPermission();
+    const nowIso = new Date().toISOString();
+    const newId = `${Date.now()}`;
+
+    let next = entries;
+    if (activeId) {
+      next = next.map((e) => (e.id === activeId ? { ...e, end: nowIso } : e));
+    }
+    const entry = { id: newId, type: newType, start: nowIso, end: null, ...(coachee ? { coachee } : {}) };
+    next = [...next, entry];
+
+    persist(next);
+    setActiveId(newId);
+    setStatus(newType === "break" ? "break" : newType === "coaching" ? "coaching" : "working");
+  }
+
+  function stopActive() {
     if (!activeId) return;
-    const next = entries.map((e) => (e.id === activeId ? { ...e, end: new Date().toISOString() } : e));
+    const nowIso = new Date().toISOString();
+    const next = entries.map((e) => (e.id === activeId ? { ...e, end: nowIso } : e));
     persist(next);
     setActiveId(null);
     setStatus("idle");
@@ -145,13 +187,97 @@ export default function TimeTracker() {
   function handleCoachSubmit() {
     if (!coachName.trim()) return;
     setShowCoachModal(false);
-    startSegment("coaching", coachName.trim());
+    switchSegment("coaching", coachName.trim());
+  }
+
+  // Midnight rollover watcher: checks every 30s whether the active entry
+  // started on a day that is no longer "today". If so, prompt the user
+  // both in-app and via a system notification, and auto-close after 10 min
+  // if there's no response.
+  useEffect(() => {
+    function check() {
+      const entry = activeEntryRef.current;
+
+      // If idle and just sitting on "today" as it rolls over, quietly
+      // move the view forward to the new day (only when the user hasn't
+      // manually browsed to a specific past date).
+      if (!entry && isLiveRef.current && selectedDateRef.current !== todayKey()) {
+        setSelectedDate(todayKey());
+      }
+
+      if (!entry || promptedRef.current) return;
+      const entryDay = todayKey(new Date(entry.start));
+      if (entryDay !== todayKey()) {
+        promptedRef.current = true;
+        setShowMidnightPrompt(true);
+        if (typeof Notification !== "undefined" && Notification.permission === "granted") {
+          try {
+            const n = new Notification("👀 Still burning the midnight oil?", {
+              body: "It's a new day and MEC Time Log still has you clocked in! Pop back in to confirm — otherwise I'll tuck yesterday into bed in 10 minutes.",
+              requireInteraction: true,
+            });
+            n.onclick = () => {
+              window.focus();
+            };
+          } catch (err) {
+            console.error("Notification error", err);
+          }
+        }
+        autoCloseTimerRef.current = setTimeout(() => {
+          finalizeCarryOver(false);
+        }, 10 * 60 * 1000);
+      }
+    }
+    const interval = setInterval(check, 30000);
+    check();
+    return () => clearInterval(interval);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  function finalizeCarryOver(stillWorking) {
+    setShowMidnightPrompt(false);
+    if (autoCloseTimerRef.current) {
+      clearTimeout(autoCloseTimerRef.current);
+      autoCloseTimerRef.current = null;
+    }
+    const entry = activeEntryRef.current;
+    if (!entry) {
+      promptedRef.current = false;
+      return;
+    }
+    const entryDay = todayKey(new Date(entry.start));
+    const closedEnd = new Date(entryDay + "T23:59:59").toISOString();
+    const oldDayEntries = entriesRef.current.map((e) => (e.id === entry.id ? { ...e, end: closedEnd } : e));
+    writeDayEntries(entryDay, oldDayEntries);
+
+    if (stillWorking) {
+      const newDay = todayKey();
+      const newId = `${Date.now()}`;
+      const newEntry = {
+        id: newId,
+        type: entry.type,
+        start: new Date().toISOString(),
+        end: null,
+        ...(entry.coachee ? { coachee: entry.coachee } : {}),
+      };
+      writeDayEntries(newDay, [newEntry]);
+      isLiveRef.current = true;
+      setSelectedDate(newDay);
+    } else {
+      setStatus("idle");
+      setActiveId(null);
+      if (selectedDate === entryDay) {
+        setEntries(oldDayEntries);
+      }
+    }
+    promptedRef.current = false;
   }
 
   const currentTime = Date.now();
+
   const totals = entries.reduce((acc, e) => {
     const start = new Date(e.start).getTime();
-    const end = e.end ? new Date(e.end).getTime() : currentTime;
+    const end = effectiveEnd(e, dateKey, currentTime);
     const dur = Math.max(0, end - start);
     acc[e.type] = (acc[e.type] || 0) + dur;
     return acc;
@@ -167,9 +293,10 @@ export default function TimeTracker() {
     coaching: { label: `Coaching · ${activeEntry?.coachee || coachName}`, sub: activeEntry ? `Since ${fmtTime(activeEntry.start)}` : "" },
   }[status];
 
-  const totalSpan = entries.length > 0
-    ? (entries[entries.length - 1].end ? new Date(entries[entries.length - 1].end).getTime() : currentTime) - new Date(entries[0].start).getTime()
-    : 0;
+  const totalSpan =
+    entries.length > 0
+      ? effectiveEnd(entries[entries.length - 1], dateKey, currentTime) - new Date(entries[0].start).getTime()
+      : 0;
 
   return (
     <div style={{ fontFamily: "'Montserrat', -apple-system, sans-serif", background: "#FBF9FD", minHeight: "100vh", padding: "24px 16px", color: COLORS.purple }}>
@@ -190,8 +317,8 @@ export default function TimeTracker() {
         <div style={{ marginBottom: 20 }}>
           <div className="viga" style={{ fontSize: 22, letterSpacing: 0.3 }}>MEC Time Log</div>
           <div style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 8 }}>
-            <input type="date" value={selectedDate} onChange={(e) => setSelectedDate(e.target.value)} style={{ padding: "6px 10px", borderRadius: 8, border: `1px solid ${COLORS.mauve}`, fontSize: 13, color: COLORS.purple, fontWeight: 600, background: "white" }} />
-            <button onClick={() => setSelectedDate(todayKey())} style={{ padding: "6px 12px", borderRadius: 8, border: "none", background: COLORS.purple, color: "white", fontSize: 12, fontWeight: 600, cursor: "pointer" }}>Today</button>
+            <input type="date" value={selectedDate} onChange={(e) => { setSelectedDate(e.target.value); isLiveRef.current = e.target.value === todayKey(); }} style={{ padding: "6px 10px", borderRadius: 8, border: `1px solid ${COLORS.mauve}`, fontSize: 13, color: COLORS.purple, fontWeight: 600, background: "white" }} />
+            <button onClick={() => { setSelectedDate(todayKey()); isLiveRef.current = true; }} style={{ padding: "6px 12px", borderRadius: 8, border: "none", background: COLORS.purple, color: "white", fontSize: 12, fontWeight: 600, cursor: "pointer" }}>Today</button>
           </div>
           <div style={{ fontSize: 13, color: COLORS.slate, marginTop: 6 }}>{new Date(selectedDate + "T00:00:00").toLocaleDateString(undefined, { weekday: "long", month: "long", day: "numeric" })}</div>
         </div>
@@ -207,10 +334,10 @@ export default function TimeTracker() {
 
         {selectedDate === todayKey() ? (
           <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, marginBottom: 16 }}>
-            <ActionButton icon={<Play size={18} />} label="Clock in" onClick={() => startSegment("work")} disabled={status !== "idle"} color={COLORS.purple} />
-            <ActionButton icon={<Coffee size={18} />} label={status === "break" ? "End break" : "Take a break"} onClick={() => (status === "break" ? (endSegment(), startSegment("work")) : (endSegment(), startSegment("break")))} disabled={status === "idle" || status === "coaching"} color={COLORS.mauve} />
-            <ActionButton icon={<GraduationCap size={18} />} label={status === "coaching" ? "End session" : "Start coaching"} onClick={() => (status === "coaching" ? endSegment() : setShowCoachModal(true))} disabled={status === "idle"} color="#8E5FB8" />
-            <ActionButton icon={<Square size={16} />} label="Clock out" onClick={endSegment} disabled={status === "idle"} color={COLORS.slate} />
+            <ActionButton icon={<Play size={18} />} label="Clock in" onClick={() => switchSegment("work")} disabled={status !== "idle"} color={COLORS.purple} />
+            <ActionButton icon={<Coffee size={18} />} label={status === "break" ? "End break" : "Take a break"} onClick={() => switchSegment(status === "break" ? "work" : "break")} disabled={status === "idle" || status === "coaching"} color={COLORS.mauve} />
+            <ActionButton icon={<GraduationCap size={18} />} label={status === "coaching" ? "End session" : "Start coaching"} onClick={() => (status === "coaching" ? stopActive() : setShowCoachModal(true))} disabled={status === "idle"} color="#8E5FB8" />
+            <ActionButton icon={<Square size={16} />} label="Clock out" onClick={stopActive} disabled={status === "idle"} color={COLORS.slate} />
           </div>
         ) : (
           <div style={{ background: COLORS.lavender, borderRadius: 12, padding: 12, marginBottom: 16, textAlign: "center", fontSize: 13, color: COLORS.slate }}>Viewing past logs — time tracking only available for today</div>
@@ -222,7 +349,7 @@ export default function TimeTracker() {
             <div style={{ display: "flex", height: 14, borderRadius: 8, overflow: "hidden", background: COLORS.lavender }}>
               {entries.map((e) => {
                 const start = new Date(e.start).getTime();
-                const end = e.end ? new Date(e.end).getTime() : currentTime;
+                const end = effectiveEnd(e, dateKey, currentTime);
                 const dur = Math.max(0, end - start);
                 const pct = totalSpan > 0 ? (dur / totalSpan) * 100 : 0;
                 return <div key={e.id} title={`${SEGMENT_LABEL[e.type]} · ${fmtDuration(dur)}`} style={{ width: `${pct}%`, background: SEGMENT_COLOR[e.type], minWidth: pct > 0 ? 2 : 0 }} />;
@@ -241,8 +368,9 @@ export default function TimeTracker() {
           {entries.length === 0 && !loading && <div style={{ fontSize: 13, color: COLORS.slate, background: COLORS.lavender, borderRadius: 12, padding: 16, textAlign: "center" }}>No entries yet. Clock in to start your day.</div>}
           {[...entries].reverse().map((e) => {
             const startTime = new Date(e.start).getTime();
-            const endTime = e.end ? new Date(e.end).getTime() : currentTime;
+            const endTime = effectiveEnd(e, dateKey, currentTime);
             const dur = Math.max(0, endTime - startTime);
+            const stillOpen = !e.end;
             return (
               <div key={e.id} style={{ background: "white", border: `1px solid ${COLORS.lavender}`, borderLeft: `4px solid ${SEGMENT_COLOR[e.type]}`, borderRadius: 10, padding: "10px 14px", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
                 <div style={{ flex: 1 }}>
@@ -250,12 +378,10 @@ export default function TimeTracker() {
                   <div style={{ fontSize: 12, color: COLORS.slate }}>{fmtTime(e.start)} – {e.end ? fmtTime(e.end) : "now"}</div>
                 </div>
                 <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-                  <div style={{ fontSize: 13, fontWeight: 600, color: e.end ? COLORS.slate : SEGMENT_COLOR[e.type], minWidth: 60, textAlign: "right" }}>{fmtDuration(dur)}{!e.end && " ●"}</div>
-                  {selectedDate === todayKey() && (
-                    <button onClick={() => deleteEntry(e.id)} style={{ background: "none", border: "none", color: COLORS.slate, cursor: "pointer", padding: "4px", display: "flex", alignItems: "center" }}>
-                      <Trash2 size={16} />
-                    </button>
-                  )}
+                  <div style={{ fontSize: 13, fontWeight: 600, color: e.end ? COLORS.slate : SEGMENT_COLOR[e.type], minWidth: 60, textAlign: "right" }}>{fmtDuration(dur)}{stillOpen && dateKey === todayKey() && " ●"}</div>
+                  <button onClick={() => deleteEntry(e.id)} style={{ background: "none", border: "none", color: COLORS.slate, cursor: "pointer", padding: "4px", display: "flex", alignItems: "center" }}>
+                    <Trash2 size={16} />
+                  </button>
                 </div>
               </div>
             );
@@ -273,6 +399,21 @@ export default function TimeTracker() {
             <label style={{ fontSize: 12, color: COLORS.slate, fontWeight: 600 }}>COACHEE'S NAME</label>
             <input autoFocus value={coachName} onChange={(e) => setCoachName(e.target.value)} onKeyDown={(e) => e.key === "Enter" && handleCoachSubmit()} placeholder="e.g. Boluwatife Adegboyega" style={{ width: "100%", marginTop: 6, padding: "10px 12px", borderRadius: 10, border: `1px solid ${COLORS.mauve}`, fontSize: 14, marginBottom: 16 }} />
             <button className="btn" onClick={handleCoachSubmit} disabled={!coachName.trim()} style={{ width: "100%", padding: "12px", borderRadius: 10, border: "none", background: COLORS.purple, color: "white", fontWeight: 600, fontSize: 14 }}>Start session</button>
+          </div>
+        </div>
+      )}
+
+      {showMidnightPrompt && (
+        <div style={{ position: "fixed", inset: 0, background: "rgba(54,11,92,0.5)", display: "flex", alignItems: "center", justifyContent: "center", padding: 20, zIndex: 60 }}>
+          <div className="fade-in" style={{ background: "white", borderRadius: 16, padding: 24, width: "100%", maxWidth: 380 }}>
+            <div className="viga" style={{ fontSize: 18, marginBottom: 8 }}>👀 Still going?</div>
+            <div style={{ fontSize: 13, color: COLORS.slate, marginBottom: 20, lineHeight: 1.5 }}>
+              Midnight came and went and you're still clocked in! Are you genuinely still at it, or did the day just quietly slip away? If I don't hear from you in 10 minutes, I'll close yesterday out for you at 11:59 PM.
+            </div>
+            <div style={{ display: "flex", gap: 10 }}>
+              <button className="btn" onClick={() => finalizeCarryOver(false)} style={{ flex: 1, padding: "12px", borderRadius: 10, border: `1px solid ${COLORS.mauve}`, background: "white", color: COLORS.purple, fontWeight: 600, fontSize: 14 }}>🌙 No, done for the day</button>
+              <button className="btn" onClick={() => finalizeCarryOver(true)} style={{ flex: 1, padding: "12px", borderRadius: 10, border: "none", background: COLORS.purple, color: "white", fontWeight: 600, fontSize: 14 }}>☕ Yes, still working</button>
+            </div>
           </div>
         </div>
       )}
