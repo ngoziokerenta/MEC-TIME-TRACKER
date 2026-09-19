@@ -12,6 +12,13 @@ import {
   Cloud,
   CloudOff,
   CalendarDays,
+  BarChart3,
+  Download,
+  Printer,
+  Pencil,
+  Plus,
+  RotateCcw,
+  FileText,
 } from "lucide-react";
 import { initializeApp } from "firebase/app";
 import { getDatabase, ref, get, set } from "firebase/database";
@@ -51,6 +58,7 @@ const app = hasFirebaseConfig ? initializeApp(firebaseConfig) : null;
 const database = app ? getDatabase(app) : null;
 
 const LOCAL_STORAGE_PREFIX = "mec-time-log:";
+const LOCAL_META_PREFIX = "mec-time-log-meta:";
 
 function todayKey(d = new Date()) {
   const year = d.getFullYear();
@@ -76,14 +84,104 @@ function readLocalDay(day) {
   }
 }
 
-function writeLocalDay(day, entriesArr) {
+function writeLocalDay(day, entriesArr, dirty = true) {
   try {
     window.localStorage.setItem(`${LOCAL_STORAGE_PREFIX}${day}`, JSON.stringify(entriesArr));
+    window.localStorage.setItem(`${LOCAL_META_PREFIX}${day}`, JSON.stringify({ dirty, updatedAt: new Date().toISOString() }));
     return true;
   } catch (error) {
     console.error("Local history write error", error);
     return false;
   }
+}
+
+function isLocalDayDirty(day) {
+  try {
+    const value = window.localStorage.getItem(`${LOCAL_META_PREFIX}${day}`);
+    return value ? Boolean(JSON.parse(value).dirty) : false;
+  } catch {
+    return false;
+  }
+}
+
+function markLocalDaySynced(day) {
+  try {
+    const value = window.localStorage.getItem(`${LOCAL_META_PREFIX}${day}`);
+    const meta = value ? JSON.parse(value) : {};
+    window.localStorage.setItem(`${LOCAL_META_PREFIX}${day}`, JSON.stringify({ ...meta, dirty: false, syncedAt: new Date().toISOString() }));
+  } catch (error) {
+    console.error("Local sync marker error", error);
+  }
+}
+
+function readAllLocalDays() {
+  try {
+    return Object.keys(window.localStorage).reduce((days, key) => {
+      if (!key.startsWith(LOCAL_STORAGE_PREFIX)) return days;
+      const day = key.slice(LOCAL_STORAGE_PREFIX.length);
+      const entries = readLocalDay(day);
+      if (entries.length || isLocalDayDirty(day)) days[day] = entries;
+      return days;
+    }, {});
+  } catch (error) {
+    console.error("Local history index error", error);
+    return {};
+  }
+}
+
+function toDateTimeInput(iso) {
+  if (!iso) return "";
+  const date = new Date(iso);
+  const offset = date.getTimezoneOffset();
+  return new Date(date.getTime() - offset * 60000).toISOString().slice(0, 16);
+}
+
+function defaultDateTimeInput(day, minutesFromMidnight) {
+  const hour = String(Math.floor(minutesFromMidnight / 60)).padStart(2, "0");
+  const minute = String(minutesFromMidnight % 60).padStart(2, "0");
+  return `${day}T${hour}:${minute}`;
+}
+
+function reportDateKeys(anchorKey, period) {
+  const anchor = new Date(`${anchorKey}T12:00:00`);
+  const start = new Date(anchor);
+  const end = new Date(anchor);
+
+  if (period === "week") {
+    const mondayOffset = (anchor.getDay() + 6) % 7;
+    start.setDate(anchor.getDate() - mondayOffset);
+    end.setDate(start.getDate() + 6);
+  } else {
+    start.setDate(1);
+    end.setMonth(start.getMonth() + 1, 0);
+  }
+
+  const keys = [];
+  const cursor = new Date(start);
+  while (cursor <= end) {
+    keys.push(todayKey(cursor));
+    cursor.setDate(cursor.getDate() + 1);
+  }
+  return keys;
+}
+
+function summarizeEntries(entriesArr, day, now = Date.now()) {
+  const summary = { work: 0, break: 0, coaching: 0, firstIn: null, lastOut: null, open: false };
+  const sorted = [...entriesArr].sort((a, b) => new Date(a.start) - new Date(b.start));
+  sorted.forEach((entry) => {
+    const start = new Date(entry.start).getTime();
+    const end = effectiveEnd(entry, day, now);
+    summary[entry.type] = (summary[entry.type] || 0) + Math.max(0, end - start);
+    if (!summary.firstIn || start < summary.firstIn) summary.firstIn = start;
+    if (entry.end && (!summary.lastOut || end > summary.lastOut)) summary.lastOut = end;
+    if (!entry.end) summary.open = true;
+  });
+  summary.logged = summary.work + summary.coaching;
+  return summary;
+}
+
+function csvCell(value) {
+  return `"${String(value ?? "").replaceAll('"', '""')}"`;
 }
 
 function fmtTime(iso) {
@@ -109,6 +207,7 @@ async function writeDayEntries(day, entriesArr) {
   if (!database) throw new Error("Firebase is not configured");
   const dbRef = ref(database, `entries/${day}`);
   await set(dbRef, entriesArr);
+  markLocalDaySynced(day);
 }
 
 export default function TimeTracker() {
@@ -124,6 +223,15 @@ export default function TimeTracker() {
   const [viewMode, setViewMode] = useState("today");
   const [syncStatus, setSyncStatus] = useState("checking");
   const [syncMessage, setSyncMessage] = useState("");
+  const [showEntryModal, setShowEntryModal] = useState(false);
+  const [editingEntryId, setEditingEntryId] = useState(null);
+  const [entryDraft, setEntryDraft] = useState(null);
+  const [entryError, setEntryError] = useState("");
+  const [undoState, setUndoState] = useState(null);
+  const [allEntriesByDay, setAllEntriesByDay] = useState({});
+  const [reportPeriod, setReportPeriod] = useState("week");
+  const [reportAnchor, setReportAnchor] = useState(todayKey());
+  const [reportLoading, setReportLoading] = useState(false);
   const dateKey = selectedDate;
 
   const activeEntry = entries.find((e) => e.id === activeId && !e.end);
@@ -158,6 +266,7 @@ export default function TimeTracker() {
     (async () => {
       setLoading(true);
       const cachedEntries = readLocalDay(dateKey);
+      const cachedIsDirty = isLocalDayDirty(dateKey);
       if (!cancelled) setEntries(cachedEntries);
 
       try {
@@ -169,14 +278,14 @@ export default function TimeTracker() {
 
         // If an earlier cloud save failed, restore the local copy to Firebase
         // instead of replacing valid local history with an empty response.
-        if (!data.length && cachedEntries.length) {
+        if (cachedIsDirty || (!data.length && cachedEntries.length)) {
           await set(dbRef, cachedEntries);
           data = cachedEntries;
         }
 
         if (cancelled) return;
         setEntries(data);
-        writeLocalDay(dateKey, data);
+        writeLocalDay(dateKey, data, false);
         setSyncStatus("synced");
         setSyncMessage("");
         const active = data.find((e) => !e.end);
@@ -218,9 +327,48 @@ export default function TimeTracker() {
     };
   }, [dateKey]);
 
+  useEffect(() => {
+    setUndoState(null);
+  }, [dateKey]);
+
+  useEffect(() => {
+    if (viewMode !== "reports") return;
+    let cancelled = false;
+
+    (async () => {
+      setReportLoading(true);
+      const localDays = readAllLocalDays();
+      if (!cancelled) setAllEntriesByDay(localDays);
+
+      try {
+        if (!database) throw new Error("Firebase is not configured");
+        const snapshot = await get(ref(database, "entries"));
+        const cloudValue = snapshot.exists() ? snapshot.val() : {};
+        const cloudDays = Object.entries(cloudValue || {}).reduce((days, [day, value]) => {
+          if (Array.isArray(value)) days[day] = value;
+          return days;
+        }, {});
+        const merged = { ...cloudDays };
+        Object.entries(localDays).forEach(([day, value]) => {
+          if (!cloudDays[day] || isLocalDayDirty(day)) merged[day] = value;
+        });
+        if (!cancelled) setAllEntriesByDay(merged);
+      } catch (error) {
+        console.error("Report history load error", error);
+      } finally {
+        if (!cancelled) setReportLoading(false);
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [viewMode]);
+
   const persist = useCallback(
     async (next) => {
       setEntries(next);
+      setAllEntriesByDay((current) => ({ ...current, [dateKey]: next }));
       const savedLocally = writeLocalDay(dateKey, next);
       setSyncStatus("saving");
       setSyncMessage("");
@@ -228,6 +376,7 @@ export default function TimeTracker() {
         if (!database) throw new Error("Firebase is not configured");
         const dbRef = ref(database, `entries/${dateKey}`);
         await set(dbRef, next);
+        markLocalDaySynced(dateKey);
         setSyncStatus("synced");
       } catch (e) {
         console.error("Firebase save error", e);
@@ -242,15 +391,128 @@ export default function TimeTracker() {
     [dateKey]
   );
 
-  const deleteEntry = (id) => {
-    if (!window.confirm("Delete this time entry? This cannot be undone.")) return;
-    const next = entries.filter((e) => e.id !== id);
+  const commitEntries = (next, label) => {
+    setUndoState({ dateKey, entries, label });
     persist(next);
+  };
+
+  const deleteEntry = (id) => {
+    if (!window.confirm("Delete this time entry? You can undo it until you leave this date.")) return;
+    const next = entries.filter((e) => e.id !== id);
+    commitEntries(next, "Entry deleted");
     if (id === activeId) {
       setActiveId(null);
       setStatus("idle");
     }
   };
+
+  function undoLastChange() {
+    if (!undoState || undoState.dateKey !== dateKey) return;
+    persist(undoState.entries);
+    const restoredActive = undoState.entries.find((entry) => !entry.end);
+    if (restoredActive && isToday) {
+      setActiveId(restoredActive.id);
+      setStatus(restoredActive.type === "break" ? "break" : restoredActive.type === "coaching" ? "coaching" : "working");
+    } else {
+      setActiveId(null);
+      setStatus("idle");
+    }
+    setUndoState(null);
+  }
+
+  function openAddEntry() {
+    const now = new Date();
+    const startMinutes = isToday ? now.getHours() * 60 + now.getMinutes() : 9 * 60;
+    const safeEndMinutes = Math.min(startMinutes + 60, 23 * 60 + 59);
+    setEditingEntryId(null);
+    setEntryDraft({
+      type: "work",
+      start: defaultDateTimeInput(dateKey, startMinutes),
+      end: defaultDateTimeInput(dateKey, safeEndMinutes),
+      coachee: "",
+      note: "",
+      reason: "Missed entry",
+    });
+    setEntryError("");
+    setShowEntryModal(true);
+  }
+
+  function openEditEntry(entry) {
+    setEditingEntryId(entry.id);
+    setEntryDraft({
+      type: entry.type,
+      start: toDateTimeInput(entry.start),
+      end: toDateTimeInput(entry.end),
+      coachee: entry.coachee || "",
+      note: entry.note || "",
+      reason: "",
+    });
+    setEntryError("");
+    setShowEntryModal(true);
+  }
+
+  function saveEntryCorrection() {
+    if (!entryDraft) return;
+    const start = new Date(entryDraft.start);
+    const end = entryDraft.end ? new Date(entryDraft.end) : null;
+
+    if (Number.isNaN(start.getTime()) || (end && Number.isNaN(end.getTime()))) {
+      setEntryError("Enter valid start and end times.");
+      return;
+    }
+    if (todayKey(start) !== dateKey || (end && todayKey(end) !== dateKey)) {
+      setEntryError("The entry must remain within the selected date.");
+      return;
+    }
+    if (end && end <= start) {
+      setEntryError("The end time must be later than the start time.");
+      return;
+    }
+    if (!end && !isToday) {
+      setEntryError("Past entries need an end time.");
+      return;
+    }
+    if (!end && entries.some((entry) => !entry.end && entry.id !== editingEntryId)) {
+      setEntryError("There is already an active entry. End it before creating another open entry.");
+      return;
+    }
+    if (!entryDraft.reason.trim()) {
+      setEntryError("Add a reason so the correction is auditable.");
+      return;
+    }
+    if (entryDraft.type === "coaching" && !entryDraft.coachee.trim()) {
+      setEntryError("Add the coachee or session label.");
+      return;
+    }
+
+    const savedEntry = {
+      id: editingEntryId || `${Date.now()}`,
+      type: entryDraft.type,
+      start: start.toISOString(),
+      end: end ? end.toISOString() : null,
+      ...(entryDraft.type === "coaching" ? { coachee: entryDraft.coachee.trim() } : {}),
+      ...(entryDraft.note.trim() ? { note: entryDraft.note.trim() } : {}),
+      editedAt: new Date().toISOString(),
+      editReason: entryDraft.reason.trim(),
+    };
+
+    const next = editingEntryId
+      ? entries.map((entry) => (entry.id === editingEntryId ? { ...entry, ...savedEntry } : entry))
+      : [...entries, savedEntry];
+    next.sort((a, b) => new Date(a.start) - new Date(b.start));
+    commitEntries(next, editingEntryId ? "Entry updated" : "Missed entry added");
+    const openEntry = next.find((entry) => !entry.end);
+    if (openEntry && isToday) {
+      setActiveId(openEntry.id);
+      setStatus(openEntry.type === "break" ? "break" : openEntry.type === "coaching" ? "coaching" : "working");
+    } else {
+      setActiveId(null);
+      setStatus("idle");
+    }
+    setShowEntryModal(false);
+    setEditingEntryId(null);
+    setEntryDraft(null);
+  }
 
   function requestNotificationPermission() {
     if (typeof Notification !== "undefined" && Notification.permission === "default") {
@@ -270,16 +532,17 @@ export default function TimeTracker() {
     const entry = { id: newId, type: newType, start: nowIso, end: null, ...(coachee ? { coachee } : {}) };
     next = [...next, entry];
 
-    persist(next);
+    commitEntries(next, newType === "work" ? "Work status updated" : newType === "break" ? "Break status updated" : "Coaching session started");
     setActiveId(newId);
     setStatus(newType === "break" ? "break" : newType === "coaching" ? "coaching" : "working");
   }
 
-  function stopActive() {
+  function stopActive(confirmClockOut = false) {
     if (!activeId) return;
+    if (confirmClockOut && !window.confirm("Clock out and end the current workday?")) return;
     const nowIso = new Date().toISOString();
     const next = entries.map((e) => (e.id === activeId ? { ...e, end: nowIso } : e));
-    persist(next);
+    commitEntries(next, "Clocked out");
     setActiveId(null);
     setStatus("idle");
   }
@@ -417,6 +680,48 @@ export default function TimeTracker() {
       ? effectiveEnd(entries[entries.length - 1], dateKey, currentTime) - new Date(entries[0].start).getTime()
       : 0;
 
+  const reportKeys = reportDateKeys(reportAnchor, reportPeriod);
+  const reportRows = reportKeys.map((day) => ({
+    day,
+    entries: allEntriesByDay[day] || [],
+    summary: summarizeEntries(allEntriesByDay[day] || [], day, currentTime),
+  }));
+  const reportTotals = reportRows.reduce(
+    (total, row) => {
+      total.work += row.summary.work;
+      total.break += row.summary.break;
+      total.coaching += row.summary.coaching;
+      total.logged += row.summary.logged;
+      if (row.entries.length) total.days += 1;
+      return total;
+    },
+    { work: 0, break: 0, coaching: 0, logged: 0, days: 0 }
+  );
+
+  function exportReportCsv() {
+    const rows = [
+      ["Date", "First in", "Last out", "Work", "Coaching", "Break", "Total logged", "Status"],
+      ...reportRows.map(({ day, entries: dayEntries, summary }) => [
+        day,
+        summary.firstIn ? fmtTime(new Date(summary.firstIn).toISOString()) : "",
+        summary.lastOut ? fmtTime(new Date(summary.lastOut).toISOString()) : "",
+        fmtDuration(summary.work),
+        fmtDuration(summary.coaching),
+        fmtDuration(summary.break),
+        fmtDuration(summary.logged),
+        summary.open ? "Open entry" : dayEntries.length ? "Complete" : "No entries",
+      ]),
+    ];
+    const csv = rows.map((row) => row.map(csvCell).join(",")).join("\n");
+    const blob = new Blob([csv], { type: "text/csv;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = `mec-time-log-${reportPeriod}-${reportKeys[0]}-to-${reportKeys[reportKeys.length - 1]}.csv`;
+    link.click();
+    URL.revokeObjectURL(url);
+  }
+
   return (
     <div style={{ fontFamily: "'Montserrat', -apple-system, sans-serif", background: "#FBF9FD", minHeight: "100vh", padding: "24px 16px", color: COLORS.purple }}>
       <style>{`
@@ -434,6 +739,11 @@ export default function TimeTracker() {
         @media (max-width: 420px) {
           .date-label { display: none; }
         }
+        @media print {
+          body { background: white !important; }
+          .no-print { display: none !important; }
+          .print-card { box-shadow: none !important; break-inside: avoid; }
+        }
       `}</style>
 
       <div style={{ maxWidth: 480, margin: "0 auto" }}>
@@ -443,7 +753,7 @@ export default function TimeTracker() {
             <SyncBadge status={syncStatus} />
           </div>
 
-          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", background: COLORS.lavender, borderRadius: 12, padding: 4, marginTop: 14 }}>
+          <div className="no-print" style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", background: COLORS.lavender, borderRadius: 12, padding: 4, marginTop: 14 }}>
             <button
               className="tab"
               onClick={() => {
@@ -465,6 +775,16 @@ export default function TimeTracker() {
             >
               History
             </button>
+            <button
+              className="tab"
+              onClick={() => {
+                setViewMode("reports");
+                isLiveRef.current = false;
+              }}
+              style={{ border: "none", borderRadius: 9, padding: "9px 12px", background: viewMode === "reports" ? "white" : "transparent", color: COLORS.purple, fontWeight: 700, boxShadow: viewMode === "reports" ? "0 2px 8px rgba(54,11,92,0.08)" : "none", display: "flex", alignItems: "center", justifyContent: "center", gap: 6 }}
+            >
+              <BarChart3 size={15} /> Reports
+            </button>
           </div>
 
           {viewMode === "history" ? (
@@ -478,9 +798,11 @@ export default function TimeTracker() {
             </div>
           ) : null}
 
-          <div className="date-label" style={{ fontSize: 13, color: COLORS.slate, marginTop: 8 }}>
-            {new Date(selectedDate + "T00:00:00").toLocaleDateString(undefined, { weekday: "long", month: "long", day: "numeric" })}
-          </div>
+          {viewMode !== "reports" && (
+            <div className="date-label" style={{ fontSize: 13, color: COLORS.slate, marginTop: 8 }}>
+              {new Date(selectedDate + "T00:00:00").toLocaleDateString(undefined, { weekday: "long", month: "long", day: "numeric" })}
+            </div>
+          )}
         </div>
 
         {syncMessage && (
@@ -490,21 +812,85 @@ export default function TimeTracker() {
           </div>
         )}
 
+        {viewMode === "reports" ? (
+          <div className="fade-in">
+            <div className="no-print" style={{ background: "white", border: `1px solid ${COLORS.lavender}`, borderRadius: 14, padding: 14, marginBottom: 14 }}>
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
+                <label style={{ fontSize: 11, color: COLORS.slate, fontWeight: 700 }}>
+                  PERIOD
+                  <select value={reportPeriod} onChange={(e) => setReportPeriod(e.target.value)} style={{ display: "block", width: "100%", marginTop: 5, height: 38, border: `1px solid ${COLORS.mauve}`, borderRadius: 9, background: "white", color: COLORS.purple, padding: "0 10px", fontWeight: 600 }}>
+                    <option value="week">Weekly</option>
+                    <option value="month">Monthly</option>
+                  </select>
+                </label>
+                <label style={{ fontSize: 11, color: COLORS.slate, fontWeight: 700 }}>
+                  DATE IN PERIOD
+                  <input type="date" value={reportAnchor} max={todayKey()} onChange={(e) => setReportAnchor(e.target.value)} style={{ display: "block", width: "100%", marginTop: 5, height: 38, border: `1px solid ${COLORS.mauve}`, borderRadius: 9, background: "white", color: COLORS.purple, padding: "0 10px", fontWeight: 600 }} />
+                </label>
+              </div>
+              <div style={{ display: "flex", gap: 8, marginTop: 12 }}>
+                <button className="btn" onClick={exportReportCsv} style={{ flex: 1, border: "none", borderRadius: 10, padding: "10px", background: COLORS.purple, color: "white", fontWeight: 700, display: "flex", alignItems: "center", justifyContent: "center", gap: 7 }}><Download size={15} /> Export CSV</button>
+                <button className="btn" onClick={() => window.print()} style={{ flex: 1, border: `1px solid ${COLORS.mauve}`, borderRadius: 10, padding: "10px", background: "white", color: COLORS.purple, fontWeight: 700, display: "flex", alignItems: "center", justifyContent: "center", gap: 7 }}><Printer size={15} /> Print / PDF</button>
+              </div>
+            </div>
+
+            <div style={{ marginBottom: 12 }}>
+              <div className="viga" style={{ fontSize: 19 }}>Time report</div>
+              <div style={{ fontSize: 12, color: COLORS.slate, marginTop: 3 }}>
+                {new Date(`${reportKeys[0]}T00:00:00`).toLocaleDateString(undefined, { day: "numeric", month: "short", year: "numeric" })} – {new Date(`${reportKeys[reportKeys.length - 1]}T00:00:00`).toLocaleDateString(undefined, { day: "numeric", month: "short", year: "numeric" })}
+              </div>
+            </div>
+
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, marginBottom: 14 }}>
+              <SummaryCard label="TOTAL LOGGED" value={fmtDuration(reportTotals.logged)} />
+              <SummaryCard label="DAYS RECORDED" value={reportTotals.days} />
+              <SummaryCard label="COACHING" value={fmtDuration(reportTotals.coaching)} />
+              <SummaryCard label="BREAKS" value={fmtDuration(reportTotals.break)} />
+            </div>
+
+            <div className="print-card" style={{ background: "white", border: `1px solid ${COLORS.lavender}`, borderRadius: 14, overflow: "hidden" }}>
+              <div style={{ display: "grid", gridTemplateColumns: "1.25fr .8fr .8fr .8fr", gap: 8, padding: "10px 12px", background: COLORS.lavender, fontSize: 10, color: COLORS.slate, fontWeight: 700 }}>
+                <span>DATE</span><span>LOGGED</span><span>BREAK</span><span>STATUS</span>
+              </div>
+              {reportLoading ? (
+                <div style={{ padding: 18, textAlign: "center", color: COLORS.slate, fontSize: 13 }}>Loading report…</div>
+              ) : reportRows.map(({ day, entries: dayEntries, summary }) => (
+                <div key={day} style={{ display: "grid", gridTemplateColumns: "1.25fr .8fr .8fr .8fr", gap: 8, alignItems: "center", padding: "11px 12px", borderTop: `1px solid ${COLORS.lavender}`, fontSize: 12 }}>
+                  <div>
+                    <div style={{ fontWeight: 700 }}>{new Date(`${day}T00:00:00`).toLocaleDateString(undefined, { weekday: "short", day: "numeric", month: "short" })}</div>
+                    {summary.firstIn && <div style={{ color: COLORS.slate, fontSize: 10, marginTop: 2 }}>{fmtTime(new Date(summary.firstIn).toISOString())} – {summary.lastOut ? fmtTime(new Date(summary.lastOut).toISOString()) : "open"}</div>}
+                  </div>
+                  <span style={{ fontWeight: 700 }}>{dayEntries.length ? fmtDuration(summary.logged) : "—"}</span>
+                  <span>{dayEntries.length ? fmtDuration(summary.break) : "—"}</span>
+                  <span style={{ color: summary.open ? "#9B5C00" : COLORS.slate, fontSize: 10, fontWeight: 700 }}>{summary.open ? "OPEN" : dayEntries.length ? "DONE" : "—"}</span>
+                </div>
+              ))}
+            </div>
+          </div>
+        ) : (
+          <>
         <div style={{ background: `linear-gradient(135deg, ${COLORS.purple}, ${COLORS.plum})`, borderRadius: 20, padding: "24px 22px", color: "white", marginBottom: 16, boxShadow: "0 8px 24px rgba(54,11,92,0.25)" }} key={refreshKey}>
           <div style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12, opacity: 0.85, textTransform: "uppercase", letterSpacing: 1 }}>
             <Clock size={14} />
             {loading ? "Loading…" : clockInTime ? `First clock-in at ${clockInTime}` : isToday ? "No activity yet today" : "No activity saved for this date"}
           </div>
-          <div className="viga fade-in" key={statusMeta.label} style={{ fontSize: 26, marginTop: 8, lineHeight: 1.2 }}>{statusMeta.label}</div>
-          <div style={{ fontSize: 13, opacity: 0.85, marginTop: 2 }}>{statusMeta.sub}</div>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-end", gap: 14, marginTop: 8 }}>
+            <div>
+              <div className="viga fade-in" key={statusMeta.label} style={{ fontSize: 26, lineHeight: 1.2 }}>{statusMeta.label}</div>
+              <div style={{ fontSize: 13, opacity: 0.85, marginTop: 2 }}>{statusMeta.sub}</div>
+            </div>
+            {activeEntry && isToday && (
+              <div aria-label="Elapsed time" style={{ fontSize: 18, fontWeight: 700, whiteSpace: "nowrap" }}>{fmtDuration(currentTime - new Date(activeEntry.start).getTime())}</div>
+            )}
+          </div>
         </div>
 
         {viewMode === "today" && isToday ? (
           <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, marginBottom: 16 }}>
             <ActionButton icon={<Play size={18} />} label="Clock in" onClick={() => switchSegment("work")} disabled={status !== "idle"} color={COLORS.purple} />
             <ActionButton icon={<Coffee size={18} />} label={status === "break" ? "End break" : "Take a break"} onClick={() => switchSegment(status === "break" ? "work" : "break")} disabled={status === "idle" || status === "coaching"} color={COLORS.mauve} />
-            <ActionButton icon={<GraduationCap size={18} />} label={status === "coaching" ? "End session" : "Start coaching"} onClick={() => (status === "coaching" ? stopActive() : setShowCoachModal(true))} disabled={status === "idle"} color="#8E5FB8" />
-            <ActionButton icon={<Square size={16} />} label="Clock out" onClick={stopActive} disabled={status === "idle"} color={COLORS.slate} />
+            <ActionButton icon={<GraduationCap size={18} />} label={status === "coaching" ? "End session" : "Start coaching"} onClick={() => (status === "coaching" ? switchSegment("work") : setShowCoachModal(true))} disabled={status === "idle"} color="#8E5FB8" />
+            <ActionButton icon={<Square size={16} />} label="Clock out" onClick={() => stopActive(true)} disabled={status === "idle"} color={COLORS.slate} />
           </div>
         ) : null}
 
@@ -537,7 +923,17 @@ export default function TimeTracker() {
           </div>
         )}
 
-        <div style={{ fontSize: 12, color: COLORS.slate, marginBottom: 6, fontWeight: 600 }}>ENTRIES</div>
+        {undoState && undoState.dateKey === dateKey && (
+          <div className="no-print" style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 10, background: "#EAF7EF", color: "#25613B", borderRadius: 11, padding: "9px 11px", marginBottom: 10, fontSize: 12 }}>
+            <span>{undoState.label}</span>
+            <button onClick={undoLastChange} style={{ border: "none", background: "transparent", color: "#25613B", fontWeight: 800, display: "flex", alignItems: "center", gap: 5 }}><RotateCcw size={14} /> Undo</button>
+          </div>
+        )}
+
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 6 }}>
+          <div style={{ fontSize: 12, color: COLORS.slate, fontWeight: 600 }}>ENTRIES</div>
+          <button className="no-print" onClick={openAddEntry} style={{ border: "none", background: "transparent", color: COLORS.purple, fontSize: 12, fontWeight: 800, display: "flex", alignItems: "center", gap: 4, padding: 4 }}><Plus size={15} /> Add missed entry</button>
+        </div>
         <div style={{ display: "flex", flexDirection: "column", gap: 8 }} key={`entries-${refreshKey}`}>
           {entries.length === 0 && !loading && <div style={{ fontSize: 13, color: COLORS.slate, background: COLORS.lavender, borderRadius: 12, padding: 16, textAlign: "center" }}>{isToday ? "No entries yet. Clock in to start your day." : "No saved entries for this date."}</div>}
           {[...entries].reverse().map((e) => {
@@ -550,10 +946,15 @@ export default function TimeTracker() {
                 <div style={{ flex: 1 }}>
                   <div style={{ fontSize: 14, fontWeight: 600 }}>{e.type === "coaching" ? `Coaching — ${e.coachee}` : SEGMENT_LABEL[e.type]}</div>
                   <div style={{ fontSize: 12, color: COLORS.slate }}>{fmtTime(e.start)} – {e.end ? fmtTime(e.end) : "now"}</div>
+                  {e.note && <div style={{ fontSize: 11, color: COLORS.slate, marginTop: 4, display: "flex", alignItems: "center", gap: 4 }}><FileText size={12} /> {e.note}</div>}
+                  {e.editReason && <div style={{ fontSize: 10, color: "#8A6A00", marginTop: 3 }}>Edited: {e.editReason}</div>}
                 </div>
                 <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
                   <div style={{ fontSize: 13, fontWeight: 600, color: e.end ? COLORS.slate : SEGMENT_COLOR[e.type], minWidth: 60, textAlign: "right" }}>{fmtDuration(dur)}{stillOpen && dateKey === todayKey() && " ●"}</div>
-                  <button onClick={() => deleteEntry(e.id)} style={{ background: "none", border: "none", color: COLORS.slate, cursor: "pointer", padding: "4px", display: "flex", alignItems: "center" }}>
+                  <button aria-label="Edit entry" onClick={() => openEditEntry(e)} style={{ background: "none", border: "none", color: COLORS.slate, cursor: "pointer", padding: "4px", display: "flex", alignItems: "center" }}>
+                    <Pencil size={15} />
+                  </button>
+                  <button aria-label="Delete entry" onClick={() => deleteEntry(e.id)} style={{ background: "none", border: "none", color: COLORS.slate, cursor: "pointer", padding: "4px", display: "flex", alignItems: "center" }}>
                     <Trash2 size={16} />
                   </button>
                 </div>
@@ -561,7 +962,66 @@ export default function TimeTracker() {
             );
           })}
         </div>
+          </>
+        )}
       </div>
+
+      {showEntryModal && entryDraft && (
+        <div style={{ position: "fixed", inset: 0, background: "rgba(54,11,92,0.45)", display: "flex", alignItems: "center", justifyContent: "center", padding: 18, zIndex: 55, overflowY: "auto" }} onClick={() => setShowEntryModal(false)}>
+          <div className="fade-in" style={{ background: "white", borderRadius: 16, padding: 22, width: "100%", maxWidth: 420, maxHeight: "92vh", overflowY: "auto" }} onClick={(event) => event.stopPropagation()}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16 }}>
+              <div className="viga" style={{ fontSize: 18 }}>{editingEntryId ? "Edit time entry" : "Add missed entry"}</div>
+              <button aria-label="Close" onClick={() => setShowEntryModal(false)} style={{ border: "none", background: "transparent", color: COLORS.slate, display: "grid", placeItems: "center" }}><X size={18} /></button>
+            </div>
+
+            <div style={{ display: "grid", gap: 12 }}>
+              <label style={{ fontSize: 11, color: COLORS.slate, fontWeight: 700 }}>
+                ACTIVITY
+                <select value={entryDraft.type} onChange={(e) => setEntryDraft({ ...entryDraft, type: e.target.value })} style={{ display: "block", width: "100%", marginTop: 5, height: 40, border: `1px solid ${COLORS.mauve}`, borderRadius: 9, padding: "0 10px", background: "white", color: COLORS.purple }}>
+                  <option value="work">Working</option>
+                  <option value="break">Break</option>
+                  <option value="coaching">Coaching</option>
+                </select>
+              </label>
+
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
+                <label style={{ fontSize: 11, color: COLORS.slate, fontWeight: 700 }}>
+                  START
+                  <input type="datetime-local" value={entryDraft.start} onChange={(e) => setEntryDraft({ ...entryDraft, start: e.target.value })} style={{ display: "block", width: "100%", marginTop: 5, height: 40, border: `1px solid ${COLORS.mauve}`, borderRadius: 9, padding: "0 8px", color: COLORS.purple }} />
+                </label>
+                <label style={{ fontSize: 11, color: COLORS.slate, fontWeight: 700 }}>
+                  END
+                  <input type="datetime-local" value={entryDraft.end} onChange={(e) => setEntryDraft({ ...entryDraft, end: e.target.value })} style={{ display: "block", width: "100%", marginTop: 5, height: 40, border: `1px solid ${COLORS.mauve}`, borderRadius: 9, padding: "0 8px", color: COLORS.purple }} />
+                </label>
+              </div>
+
+              {entryDraft.type === "coaching" && (
+                <label style={{ fontSize: 11, color: COLORS.slate, fontWeight: 700 }}>
+                  COACHEE OR SESSION LABEL
+                  <input value={entryDraft.coachee} onChange={(e) => setEntryDraft({ ...entryDraft, coachee: e.target.value })} placeholder="e.g. Session 8" style={{ display: "block", width: "100%", marginTop: 5, height: 40, border: `1px solid ${COLORS.mauve}`, borderRadius: 9, padding: "0 10px", color: COLORS.purple }} />
+                </label>
+              )}
+
+              <label style={{ fontSize: 11, color: COLORS.slate, fontWeight: 700 }}>
+                NOTE <span style={{ fontWeight: 400 }}>(optional)</span>
+                <input value={entryDraft.note} onChange={(e) => setEntryDraft({ ...entryDraft, note: e.target.value })} placeholder="What was completed?" style={{ display: "block", width: "100%", marginTop: 5, height: 40, border: `1px solid ${COLORS.mauve}`, borderRadius: 9, padding: "0 10px", color: COLORS.purple }} />
+              </label>
+
+              <label style={{ fontSize: 11, color: COLORS.slate, fontWeight: 700 }}>
+                REASON FOR CHANGE
+                <input value={entryDraft.reason} onChange={(e) => setEntryDraft({ ...entryDraft, reason: e.target.value })} placeholder="e.g. Forgot to clock out" style={{ display: "block", width: "100%", marginTop: 5, height: 40, border: `1px solid ${COLORS.mauve}`, borderRadius: 9, padding: "0 10px", color: COLORS.purple }} />
+              </label>
+            </div>
+
+            {entryError && <div role="alert" style={{ background: "#FDECEC", color: "#8B2525", borderRadius: 9, padding: "9px 10px", fontSize: 12, marginTop: 12 }}>{entryError}</div>}
+
+            <div style={{ display: "flex", gap: 9, marginTop: 16 }}>
+              <button onClick={() => setShowEntryModal(false)} style={{ flex: 1, padding: 11, borderRadius: 10, border: `1px solid ${COLORS.mauve}`, background: "white", color: COLORS.purple, fontWeight: 700 }}>Cancel</button>
+              <button onClick={saveEntryCorrection} style={{ flex: 1, padding: 11, borderRadius: 10, border: "none", background: COLORS.purple, color: "white", fontWeight: 700 }}>{editingEntryId ? "Save correction" : "Add entry"}</button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {showCoachModal && (
         <div style={{ position: "fixed", inset: 0, background: "rgba(54,11,92,0.35)", display: "flex", alignItems: "center", justifyContent: "center", padding: 20, zIndex: 50 }} onClick={() => setShowCoachModal(false)}>
