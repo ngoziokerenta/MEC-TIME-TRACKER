@@ -1,5 +1,18 @@
 import React, { useState, useEffect, useCallback, useRef } from "react";
-import { Play, Coffee, Square, GraduationCap, Clock, X, Trash2 } from "lucide-react";
+import {
+  Play,
+  Coffee,
+  Square,
+  GraduationCap,
+  Clock,
+  X,
+  Trash2,
+  ChevronLeft,
+  ChevronRight,
+  Cloud,
+  CloudOff,
+  CalendarDays,
+} from "lucide-react";
 import { initializeApp } from "firebase/app";
 import { getDatabase, ref, get, set } from "firebase/database";
 
@@ -33,11 +46,44 @@ const firebaseConfig = {
   appId: import.meta.env.VITE_FIREBASE_APP_ID,
 };
 
-const app = initializeApp(firebaseConfig);
-const database = getDatabase(app);
+const hasFirebaseConfig = Object.values(firebaseConfig).every(Boolean);
+const app = hasFirebaseConfig ? initializeApp(firebaseConfig) : null;
+const database = app ? getDatabase(app) : null;
+
+const LOCAL_STORAGE_PREFIX = "mec-time-log:";
 
 function todayKey(d = new Date()) {
-  return d.toISOString().slice(0, 10);
+  const year = d.getFullYear();
+  const month = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
+}
+
+function shiftDate(dateKey, amount) {
+  const date = new Date(`${dateKey}T12:00:00`);
+  date.setDate(date.getDate() + amount);
+  return todayKey(date);
+}
+
+function readLocalDay(day) {
+  try {
+    const value = window.localStorage.getItem(`${LOCAL_STORAGE_PREFIX}${day}`);
+    const parsed = value ? JSON.parse(value) : [];
+    return Array.isArray(parsed) ? parsed : [];
+  } catch (error) {
+    console.error("Local history read error", error);
+    return [];
+  }
+}
+
+function writeLocalDay(day, entriesArr) {
+  try {
+    window.localStorage.setItem(`${LOCAL_STORAGE_PREFIX}${day}`, JSON.stringify(entriesArr));
+    return true;
+  } catch (error) {
+    console.error("Local history write error", error);
+    return false;
+  }
 }
 
 function fmtTime(iso) {
@@ -59,12 +105,10 @@ function effectiveEnd(entry, dateKey, currentTime) {
 }
 
 async function writeDayEntries(day, entriesArr) {
-  try {
-    const dbRef = ref(database, `entries/${day}`);
-    await set(dbRef, entriesArr);
-  } catch (err) {
-    console.error("Firebase write error", err);
-  }
+  writeLocalDay(day, entriesArr);
+  if (!database) throw new Error("Firebase is not configured");
+  const dbRef = ref(database, `entries/${day}`);
+  await set(dbRef, entriesArr);
 }
 
 export default function TimeTracker() {
@@ -77,6 +121,9 @@ export default function TimeTracker() {
   const [loading, setLoading] = useState(true);
   const [refreshKey, setRefreshKey] = useState(0);
   const [selectedDate, setSelectedDate] = useState(todayKey());
+  const [viewMode, setViewMode] = useState("today");
+  const [syncStatus, setSyncStatus] = useState("checking");
+  const [syncMessage, setSyncMessage] = useState("");
   const dateKey = selectedDate;
 
   const activeEntry = entries.find((e) => e.id === activeId && !e.end);
@@ -106,12 +153,32 @@ export default function TimeTracker() {
   }, []);
 
   useEffect(() => {
+    let cancelled = false;
+
     (async () => {
+      setLoading(true);
+      const cachedEntries = readLocalDay(dateKey);
+      if (!cancelled) setEntries(cachedEntries);
+
       try {
+        if (!database) throw new Error("Firebase is not configured");
         const dbRef = ref(database, `entries/${dateKey}`);
         const snapshot = await get(dbRef);
-        const data = snapshot.exists() ? snapshot.val() : [];
+        let data = snapshot.exists() ? snapshot.val() : [];
+        data = Array.isArray(data) ? data : [];
+
+        // If an earlier cloud save failed, restore the local copy to Firebase
+        // instead of replacing valid local history with an empty response.
+        if (!data.length && cachedEntries.length) {
+          await set(dbRef, cachedEntries);
+          data = cachedEntries;
+        }
+
+        if (cancelled) return;
         setEntries(data);
+        writeLocalDay(dateKey, data);
+        setSyncStatus("synced");
+        setSyncMessage("");
         const active = data.find((e) => !e.end);
         if (active && dateKey === todayKey()) {
           setStatus(active.type === "break" ? "break" : active.type === "coaching" ? "coaching" : "working");
@@ -123,27 +190,60 @@ export default function TimeTracker() {
         }
       } catch (e) {
         console.error("Firebase load error", e);
-        setEntries([]);
+        if (cancelled) return;
+        setEntries(cachedEntries);
+        setSyncStatus("local");
+        setSyncMessage(
+          cachedEntries.length
+            ? "Cloud sync is unavailable. Your history is still saved on this device."
+            : "Cloud sync is unavailable. New entries will be saved on this device."
+        );
+
+        const active = cachedEntries.find((entry) => !entry.end);
+        if (active && dateKey === todayKey()) {
+          setStatus(active.type === "break" ? "break" : active.type === "coaching" ? "coaching" : "working");
+          setActiveId(active.id);
+          if (active.coachee) setCoachName(active.coachee);
+        } else {
+          setStatus("idle");
+          setActiveId(null);
+        }
       } finally {
-        setLoading(false);
+        if (!cancelled) setLoading(false);
       }
     })();
+
+    return () => {
+      cancelled = true;
+    };
   }, [dateKey]);
 
   const persist = useCallback(
     async (next) => {
       setEntries(next);
+      const savedLocally = writeLocalDay(dateKey, next);
+      setSyncStatus("saving");
+      setSyncMessage("");
       try {
+        if (!database) throw new Error("Firebase is not configured");
         const dbRef = ref(database, `entries/${dateKey}`);
         await set(dbRef, next);
+        setSyncStatus("synced");
       } catch (e) {
         console.error("Firebase save error", e);
+        setSyncStatus(savedLocally ? "local" : "error");
+        setSyncMessage(
+          savedLocally
+            ? "Saved on this device, but cloud sync failed. Check your Firebase settings."
+            : "This entry could not be saved. Please try again."
+        );
       }
     },
     [dateKey]
   );
 
   const deleteEntry = (id) => {
+    if (!window.confirm("Delete this time entry? This cannot be undone.")) return;
     const next = entries.filter((e) => e.id !== id);
     persist(next);
     if (id === activeId) {
@@ -234,7 +334,7 @@ export default function TimeTracker() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  function finalizeCarryOver(stillWorking) {
+  async function finalizeCarryOver(stillWorking) {
     setShowMidnightPrompt(false);
     if (autoCloseTimerRef.current) {
       clearTimeout(autoCloseTimerRef.current);
@@ -248,7 +348,15 @@ export default function TimeTracker() {
     const entryDay = todayKey(new Date(entry.start));
     const closedEnd = new Date(entryDay + "T23:59:59").toISOString();
     const oldDayEntries = entriesRef.current.map((e) => (e.id === entry.id ? { ...e, end: closedEnd } : e));
-    writeDayEntries(entryDay, oldDayEntries);
+    try {
+      await writeDayEntries(entryDay, oldDayEntries);
+      setSyncStatus("synced");
+      setSyncMessage("");
+    } catch (error) {
+      console.error("Midnight history sync error", error);
+      setSyncStatus("local");
+      setSyncMessage("The midnight update is saved on this device, but cloud sync failed.");
+    }
 
     if (stillWorking) {
       const newDay = todayKey();
@@ -260,8 +368,15 @@ export default function TimeTracker() {
         end: null,
         ...(entry.coachee ? { coachee: entry.coachee } : {}),
       };
-      writeDayEntries(newDay, [newEntry]);
+      try {
+        await writeDayEntries(newDay, [newEntry]);
+      } catch (error) {
+        console.error("New day sync error", error);
+        setSyncStatus("local");
+        setSyncMessage("The new day is saved on this device, but cloud sync failed.");
+      }
       isLiveRef.current = true;
+      setViewMode("today");
       setSelectedDate(newDay);
     } else {
       setStatus("idle");
@@ -274,6 +389,7 @@ export default function TimeTracker() {
   }
 
   const currentTime = Date.now();
+  const isToday = dateKey === todayKey();
 
   const totals = entries.reduce((acc, e) => {
     const start = new Date(e.start).getTime();
@@ -287,7 +403,10 @@ export default function TimeTracker() {
   const clockInTime = dayStart ? fmtTime(dayStart.toISOString()) : null;
 
   const statusMeta = {
-    idle: { label: entries.length ? "Clocked out" : "Not clocked in", sub: "Ready when you are" },
+    idle: {
+      label: entries.length ? (isToday ? "Clocked out" : "Day completed") : isToday ? "Not clocked in" : "No saved activity",
+      sub: isToday ? "Ready when you are" : entries.length ? "Review the day's activity below" : "Choose another date to review",
+    },
     working: { label: "Working", sub: activeEntry ? `Since ${fmtTime(activeEntry.start)}` : "" },
     break: { label: "On break", sub: activeEntry ? `Since ${fmtTime(activeEntry.start)}` : "" },
     coaching: { label: `Coaching · ${activeEntry?.coachee || coachName}`, sub: activeEntry ? `Since ${fmtTime(activeEntry.start)}` : "" },
@@ -308,39 +427,94 @@ export default function TimeTracker() {
         button:disabled { cursor: not-allowed; opacity: 0.4; }
         .btn { transition: transform 0.1s ease, box-shadow 0.15s ease; }
         .btn:active:not(:disabled) { transform: scale(0.97); }
+        .tab { transition: background 0.15s ease, color 0.15s ease; }
         .fade-in { animation: fadeIn 0.3s ease; }
         @keyframes fadeIn { from { opacity: 0; transform: translateY(4px);} to { opacity: 1; transform: translateY(0);} }
         input:focus { outline: 2px solid ${COLORS.purple}; outline-offset: 1px; }
+        @media (max-width: 420px) {
+          .date-label { display: none; }
+        }
       `}</style>
 
       <div style={{ maxWidth: 480, margin: "0 auto" }}>
         <div style={{ marginBottom: 20 }}>
-          <div className="viga" style={{ fontSize: 22, letterSpacing: 0.3 }}>MEC Time Log</div>
-          <div style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 8 }}>
-            <input type="date" value={selectedDate} onChange={(e) => { setSelectedDate(e.target.value); isLiveRef.current = e.target.value === todayKey(); }} style={{ padding: "6px 10px", borderRadius: 8, border: `1px solid ${COLORS.mauve}`, fontSize: 13, color: COLORS.purple, fontWeight: 600, background: "white" }} />
-            <button onClick={() => { setSelectedDate(todayKey()); isLiveRef.current = true; }} style={{ padding: "6px 12px", borderRadius: 8, border: "none", background: COLORS.purple, color: "white", fontSize: 12, fontWeight: 600, cursor: "pointer" }}>Today</button>
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12 }}>
+            <div className="viga" style={{ fontSize: 22, letterSpacing: 0.3 }}>MEC Time Log</div>
+            <SyncBadge status={syncStatus} />
           </div>
-          <div style={{ fontSize: 13, color: COLORS.slate, marginTop: 6 }}>{new Date(selectedDate + "T00:00:00").toLocaleDateString(undefined, { weekday: "long", month: "long", day: "numeric" })}</div>
+
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", background: COLORS.lavender, borderRadius: 12, padding: 4, marginTop: 14 }}>
+            <button
+              className="tab"
+              onClick={() => {
+                setViewMode("today");
+                setSelectedDate(todayKey());
+                isLiveRef.current = true;
+              }}
+              style={{ border: "none", borderRadius: 9, padding: "9px 12px", background: viewMode === "today" ? "white" : "transparent", color: COLORS.purple, fontWeight: 700, boxShadow: viewMode === "today" ? "0 2px 8px rgba(54,11,92,0.08)" : "none" }}
+            >
+              Today
+            </button>
+            <button
+              className="tab"
+              onClick={() => {
+                setViewMode("history");
+                isLiveRef.current = false;
+              }}
+              style={{ border: "none", borderRadius: 9, padding: "9px 12px", background: viewMode === "history" ? "white" : "transparent", color: COLORS.purple, fontWeight: 700, boxShadow: viewMode === "history" ? "0 2px 8px rgba(54,11,92,0.08)" : "none" }}
+            >
+              History
+            </button>
+          </div>
+
+          {viewMode === "history" ? (
+            <div style={{ display: "grid", gridTemplateColumns: "40px 1fr 40px", alignItems: "center", gap: 8, marginTop: 12 }}>
+              <button aria-label="Previous day" onClick={() => setSelectedDate(shiftDate(selectedDate, -1))} style={{ height: 38, borderRadius: 10, border: `1px solid ${COLORS.lavender}`, background: "white", color: COLORS.purple, display: "grid", placeItems: "center" }}><ChevronLeft size={18} /></button>
+              <label style={{ position: "relative", display: "flex", alignItems: "center" }}>
+                <CalendarDays size={16} style={{ position: "absolute", left: 12, color: COLORS.slate, pointerEvents: "none" }} />
+                <input aria-label="History date" type="date" value={selectedDate} max={todayKey()} onChange={(e) => setSelectedDate(e.target.value)} style={{ width: "100%", height: 38, padding: "6px 10px 6px 38px", borderRadius: 10, border: `1px solid ${COLORS.mauve}`, fontSize: 13, color: COLORS.purple, fontWeight: 600, background: "white" }} />
+              </label>
+              <button aria-label="Next day" disabled={selectedDate >= todayKey()} onClick={() => setSelectedDate(shiftDate(selectedDate, 1))} style={{ height: 38, borderRadius: 10, border: `1px solid ${COLORS.lavender}`, background: "white", color: COLORS.purple, display: "grid", placeItems: "center" }}><ChevronRight size={18} /></button>
+            </div>
+          ) : null}
+
+          <div className="date-label" style={{ fontSize: 13, color: COLORS.slate, marginTop: 8 }}>
+            {new Date(selectedDate + "T00:00:00").toLocaleDateString(undefined, { weekday: "long", month: "long", day: "numeric" })}
+          </div>
         </div>
+
+        {syncMessage && (
+          <div role="status" style={{ display: "flex", gap: 8, alignItems: "flex-start", background: "#FFF7E8", color: "#704C00", border: "1px solid #F2D28F", borderRadius: 12, padding: "10px 12px", fontSize: 12, lineHeight: 1.45, marginBottom: 14 }}>
+            <CloudOff size={16} style={{ flex: "0 0 auto", marginTop: 1 }} />
+            <span>{syncMessage}</span>
+          </div>
+        )}
 
         <div style={{ background: `linear-gradient(135deg, ${COLORS.purple}, ${COLORS.plum})`, borderRadius: 20, padding: "24px 22px", color: "white", marginBottom: 16, boxShadow: "0 8px 24px rgba(54,11,92,0.25)" }} key={refreshKey}>
           <div style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12, opacity: 0.85, textTransform: "uppercase", letterSpacing: 1 }}>
             <Clock size={14} />
-            {loading ? "Loading…" : clockInTime ? `Clocked in at ${clockInTime}` : "No activity yet today"}
+            {loading ? "Loading…" : clockInTime ? `First clock-in at ${clockInTime}` : isToday ? "No activity yet today" : "No activity saved for this date"}
           </div>
           <div className="viga fade-in" key={statusMeta.label} style={{ fontSize: 26, marginTop: 8, lineHeight: 1.2 }}>{statusMeta.label}</div>
           <div style={{ fontSize: 13, opacity: 0.85, marginTop: 2 }}>{statusMeta.sub}</div>
         </div>
 
-        {selectedDate === todayKey() ? (
+        {viewMode === "today" && isToday ? (
           <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, marginBottom: 16 }}>
             <ActionButton icon={<Play size={18} />} label="Clock in" onClick={() => switchSegment("work")} disabled={status !== "idle"} color={COLORS.purple} />
             <ActionButton icon={<Coffee size={18} />} label={status === "break" ? "End break" : "Take a break"} onClick={() => switchSegment(status === "break" ? "work" : "break")} disabled={status === "idle" || status === "coaching"} color={COLORS.mauve} />
             <ActionButton icon={<GraduationCap size={18} />} label={status === "coaching" ? "End session" : "Start coaching"} onClick={() => (status === "coaching" ? stopActive() : setShowCoachModal(true))} disabled={status === "idle"} color="#8E5FB8" />
             <ActionButton icon={<Square size={16} />} label="Clock out" onClick={stopActive} disabled={status === "idle"} color={COLORS.slate} />
           </div>
-        ) : (
-          <div style={{ background: COLORS.lavender, borderRadius: 12, padding: 12, marginBottom: 16, textAlign: "center", fontSize: 13, color: COLORS.slate }}>Viewing past logs — time tracking only available for today</div>
+        ) : null}
+
+        {viewMode === "history" && entries.length > 0 && (
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, marginBottom: 16 }}>
+            <SummaryCard label="WORK + COACHING" value={fmtDuration((totals.work || 0) + (totals.coaching || 0))} />
+            <SummaryCard label="BREAKS" value={fmtDuration(totals.break || 0)} />
+            <SummaryCard label="FIRST IN" value={clockInTime || "—"} />
+            <SummaryCard label="DAY SPAN" value={fmtDuration(totalSpan)} />
+          </div>
         )}
 
         {entries.length > 0 && (
@@ -365,7 +539,7 @@ export default function TimeTracker() {
 
         <div style={{ fontSize: 12, color: COLORS.slate, marginBottom: 6, fontWeight: 600 }}>ENTRIES</div>
         <div style={{ display: "flex", flexDirection: "column", gap: 8 }} key={`entries-${refreshKey}`}>
-          {entries.length === 0 && !loading && <div style={{ fontSize: 13, color: COLORS.slate, background: COLORS.lavender, borderRadius: 12, padding: 16, textAlign: "center" }}>No entries yet. Clock in to start your day.</div>}
+          {entries.length === 0 && !loading && <div style={{ fontSize: 13, color: COLORS.slate, background: COLORS.lavender, borderRadius: 12, padding: 16, textAlign: "center" }}>{isToday ? "No entries yet. Clock in to start your day." : "No saved entries for this date."}</div>}
           {[...entries].reverse().map((e) => {
             const startTime = new Date(e.start).getTime();
             const endTime = effectiveEnd(e, dateKey, currentTime);
@@ -397,7 +571,7 @@ export default function TimeTracker() {
               <X size={18} onClick={() => setShowCoachModal(false)} style={{ cursor: "pointer", color: COLORS.slate }} />
             </div>
             <label style={{ fontSize: 12, color: COLORS.slate, fontWeight: 600 }}>COACHEE'S NAME</label>
-            <input autoFocus value={coachName} onChange={(e) => setCoachName(e.target.value)} onKeyDown={(e) => e.key === "Enter" && handleCoachSubmit()} placeholder="e.g. Boluwatife Adegboyega" style={{ width: "100%", marginTop: 6, padding: "10px 12px", borderRadius: 10, border: `1px solid ${COLORS.mauve}`, fontSize: 14, marginBottom: 16 }} />
+            <input autoFocus value={coachName} onChange={(e) => setCoachName(e.target.value)} onKeyDown={(e) => e.key === "Enter" && handleCoachSubmit()} placeholder="e.g. Client or participant name" style={{ width: "100%", marginTop: 6, padding: "10px 12px", borderRadius: 10, border: `1px solid ${COLORS.mauve}`, fontSize: 14, marginBottom: 16 }} />
             <button className="btn" onClick={handleCoachSubmit} disabled={!coachName.trim()} style={{ width: "100%", padding: "12px", borderRadius: 10, border: "none", background: COLORS.purple, color: "white", fontWeight: 600, fontSize: 14 }}>Start session</button>
           </div>
         </div>
@@ -427,5 +601,31 @@ function ActionButton({ icon, label, onClick, disabled, color }) {
       {icon}
       {label}
     </button>
+  );
+}
+
+function SyncBadge({ status }) {
+  const meta = {
+    checking: { label: "Checking", icon: <Cloud size={14} />, background: COLORS.lavender, color: COLORS.slate },
+    saving: { label: "Saving", icon: <Cloud size={14} />, background: COLORS.lavender, color: COLORS.slate },
+    synced: { label: "Synced", icon: <Cloud size={14} />, background: "#EAF7EF", color: "#25613B" },
+    local: { label: "On device", icon: <CloudOff size={14} />, background: "#FFF7E8", color: "#704C00" },
+    error: { label: "Not saved", icon: <CloudOff size={14} />, background: "#FDECEC", color: "#8B2525" },
+  }[status];
+
+  return (
+    <div title={status === "local" ? "Cloud sync unavailable; using this device's storage" : undefined} style={{ display: "inline-flex", alignItems: "center", gap: 6, padding: "6px 9px", borderRadius: 999, background: meta.background, color: meta.color, fontSize: 11, fontWeight: 700, whiteSpace: "nowrap" }}>
+      {meta.icon}
+      {meta.label}
+    </div>
+  );
+}
+
+function SummaryCard({ label, value }) {
+  return (
+    <div style={{ background: "white", border: `1px solid ${COLORS.lavender}`, borderRadius: 12, padding: "11px 12px" }}>
+      <div style={{ fontSize: 10, color: COLORS.slate, fontWeight: 700, letterSpacing: 0.45 }}>{label}</div>
+      <div className="viga" style={{ fontSize: 17, color: COLORS.purple, marginTop: 3 }}>{value}</div>
+    </div>
   );
 }
