@@ -863,18 +863,18 @@ export default function TimeTracker() {
         .btn:active:not(:disabled) { transform: scale(0.97); }
         .tab { transition: background 0.15s ease, color 0.15s ease; }
         .fade-in { animation: fadeIn 0.3s ease; }
-        .app-shell { width: 100%; max-width: 1060px; margin: 0 auto; display: grid; grid-template-columns: 290px minmax(0, 480px); gap: 28px; justify-content: center; align-items: start; }
-        .tracker-column { width: 100%; min-width: 0; }
-        .todo-panel { position: sticky; top: 24px; }
+        .app-shell { width: 100%; max-width: 1100px; margin: 0 auto; position: relative; }
+        .tracker-column { width: 100%; max-width: 480px; min-width: 0; margin: 0 auto; }
+        .todo-panel { position: absolute; top: 0; left: 0; width: 290px; }
         @keyframes fadeIn { from { opacity: 0; transform: translateY(4px);} to { opacity: 1; transform: translateY(0);} }
         input:focus { outline: 2px solid ${COLORS.purple}; outline-offset: 1px; }
         @media (max-width: 420px) {
           .date-label { display: none; }
         }
         @media (max-width: 850px) {
-          .app-shell { max-width: 480px; grid-template-columns: minmax(0, 1fr); gap: 18px; }
+          .app-shell { max-width: 480px; display: flex; flex-direction: column; gap: 18px; }
           .tracker-column { order: 1; }
-          .todo-panel { order: 2; position: static; }
+          .todo-panel { order: 2; position: static; width: 100%; }
         }
         @media print {
           body { background: white !important; }
