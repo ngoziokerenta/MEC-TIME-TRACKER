@@ -19,6 +19,8 @@ import {
   Plus,
   RotateCcw,
   FileText,
+  ListTodo,
+  Check,
 } from "lucide-react";
 import { initializeApp } from "firebase/app";
 import { getDatabase, ref, get, set } from "firebase/database";
@@ -59,6 +61,8 @@ const database = app ? getDatabase(app) : null;
 
 const LOCAL_STORAGE_PREFIX = "mec-time-log:";
 const LOCAL_META_PREFIX = "mec-time-log-meta:";
+const TODO_STORAGE_PREFIX = "mec-todos:";
+const TODO_META_PREFIX = "mec-todos-meta:";
 
 function todayKey(d = new Date()) {
   const year = d.getFullYear();
@@ -111,6 +115,47 @@ function markLocalDaySynced(day) {
     window.localStorage.setItem(`${LOCAL_META_PREFIX}${day}`, JSON.stringify({ ...meta, dirty: false, syncedAt: new Date().toISOString() }));
   } catch (error) {
     console.error("Local sync marker error", error);
+  }
+}
+
+function readLocalTodos(day) {
+  try {
+    const value = window.localStorage.getItem(`${TODO_STORAGE_PREFIX}${day}`);
+    const parsed = value ? JSON.parse(value) : [];
+    return Array.isArray(parsed) ? parsed : [];
+  } catch (error) {
+    console.error("Local to-do read error", error);
+    return [];
+  }
+}
+
+function writeLocalTodos(day, todosArr, dirty = true) {
+  try {
+    window.localStorage.setItem(`${TODO_STORAGE_PREFIX}${day}`, JSON.stringify(todosArr));
+    window.localStorage.setItem(`${TODO_META_PREFIX}${day}`, JSON.stringify({ dirty, updatedAt: new Date().toISOString() }));
+    return true;
+  } catch (error) {
+    console.error("Local to-do write error", error);
+    return false;
+  }
+}
+
+function isLocalTodoDirty(day) {
+  try {
+    const value = window.localStorage.getItem(`${TODO_META_PREFIX}${day}`);
+    return value ? Boolean(JSON.parse(value).dirty) : false;
+  } catch {
+    return false;
+  }
+}
+
+function markLocalTodosSynced(day) {
+  try {
+    const value = window.localStorage.getItem(`${TODO_META_PREFIX}${day}`);
+    const meta = value ? JSON.parse(value) : {};
+    window.localStorage.setItem(`${TODO_META_PREFIX}${day}`, JSON.stringify({ ...meta, dirty: false, syncedAt: new Date().toISOString() }));
+  } catch (error) {
+    console.error("Local to-do sync marker error", error);
   }
 }
 
@@ -232,7 +277,11 @@ export default function TimeTracker() {
   const [reportPeriod, setReportPeriod] = useState("week");
   const [reportAnchor, setReportAnchor] = useState(todayKey());
   const [reportLoading, setReportLoading] = useState(false);
+  const [todos, setTodos] = useState([]);
+  const [todoText, setTodoText] = useState("");
+  const [todoSyncStatus, setTodoSyncStatus] = useState("checking");
   const dateKey = selectedDate;
+  const todoDay = todayKey();
 
   const activeEntry = entries.find((e) => e.id === activeId && !e.end);
 
@@ -364,6 +413,86 @@ export default function TimeTracker() {
       cancelled = true;
     };
   }, [viewMode]);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    (async () => {
+      const cachedTodos = readLocalTodos(todoDay);
+      const cachedIsDirty = isLocalTodoDirty(todoDay);
+      if (!cancelled) setTodos(cachedTodos);
+
+      try {
+        if (!database) throw new Error("Firebase is not configured");
+        const dbRef = ref(database, `todos/${todoDay}`);
+        const snapshot = await get(dbRef);
+        let data = snapshot.exists() ? snapshot.val() : [];
+        data = Array.isArray(data) ? data : [];
+
+        if (cachedIsDirty || (!data.length && cachedTodos.length)) {
+          await set(dbRef, cachedTodos);
+          data = cachedTodos;
+        }
+
+        if (cancelled) return;
+        setTodos(data);
+        writeLocalTodos(todoDay, data, false);
+        setTodoSyncStatus("synced");
+      } catch (error) {
+        console.error("To-do sync load error", error);
+        if (!cancelled) {
+          setTodos(cachedTodos);
+          setTodoSyncStatus("local");
+        }
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [todoDay]);
+
+  const persistTodos = useCallback(
+    async (next) => {
+      setTodos(next);
+      const savedLocally = writeLocalTodos(todoDay, next);
+      setTodoSyncStatus("saving");
+      try {
+        if (!database) throw new Error("Firebase is not configured");
+        await set(ref(database, `todos/${todoDay}`), next);
+        markLocalTodosSynced(todoDay);
+        setTodoSyncStatus("synced");
+      } catch (error) {
+        console.error("To-do sync save error", error);
+        setTodoSyncStatus(savedLocally ? "local" : "error");
+      }
+    },
+    [todoDay]
+  );
+
+  function addTodo() {
+    const text = todoText.trim();
+    if (!text) return;
+    const next = [
+      ...todos,
+      { id: `${Date.now()}`, text, completed: false, createdAt: new Date().toISOString() },
+    ];
+    persistTodos(next);
+    setTodoText("");
+  }
+
+  function toggleTodo(id) {
+    const next = todos.map((todo) =>
+      todo.id === id
+        ? { ...todo, completed: !todo.completed, completedAt: !todo.completed ? new Date().toISOString() : null }
+        : todo
+    );
+    persistTodos(next);
+  }
+
+  function deleteTodo(id) {
+    persistTodos(todos.filter((todo) => todo.id !== id));
+  }
 
   const persist = useCallback(
     async (next) => {
@@ -734,10 +863,18 @@ export default function TimeTracker() {
         .btn:active:not(:disabled) { transform: scale(0.97); }
         .tab { transition: background 0.15s ease, color 0.15s ease; }
         .fade-in { animation: fadeIn 0.3s ease; }
+        .app-shell { width: 100%; max-width: 1060px; margin: 0 auto; display: grid; grid-template-columns: 290px minmax(0, 480px); gap: 28px; justify-content: center; align-items: start; }
+        .tracker-column { width: 100%; min-width: 0; }
+        .todo-panel { position: sticky; top: 24px; }
         @keyframes fadeIn { from { opacity: 0; transform: translateY(4px);} to { opacity: 1; transform: translateY(0);} }
         input:focus { outline: 2px solid ${COLORS.purple}; outline-offset: 1px; }
         @media (max-width: 420px) {
           .date-label { display: none; }
+        }
+        @media (max-width: 850px) {
+          .app-shell { max-width: 480px; grid-template-columns: minmax(0, 1fr); gap: 18px; }
+          .tracker-column { order: 1; }
+          .todo-panel { order: 2; position: static; }
         }
         @media print {
           body { background: white !important; }
@@ -746,7 +883,18 @@ export default function TimeTracker() {
         }
       `}</style>
 
-      <div style={{ maxWidth: 480, margin: "0 auto" }}>
+      <div className="app-shell">
+        <TodoPanel
+          todos={todos}
+          text={todoText}
+          onTextChange={setTodoText}
+          onAdd={addTodo}
+          onToggle={toggleTodo}
+          onDelete={deleteTodo}
+          syncStatus={todoSyncStatus}
+        />
+
+        <div className="tracker-column">
         <div style={{ marginBottom: 20 }}>
           <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12 }}>
             <div className="viga" style={{ fontSize: 22, letterSpacing: 0.3 }}>MEC Time Log</div>
@@ -965,6 +1113,7 @@ export default function TimeTracker() {
           </>
         )}
       </div>
+      </div>
 
       {showEntryModal && entryDraft && (
         <div style={{ position: "fixed", inset: 0, background: "rgba(54,11,92,0.45)", display: "flex", alignItems: "center", justifyContent: "center", padding: 18, zIndex: 55, overflowY: "auto" }} onClick={() => setShowEntryModal(false)}>
@@ -1061,6 +1210,68 @@ function ActionButton({ icon, label, onClick, disabled, color }) {
       {icon}
       {label}
     </button>
+  );
+}
+
+function TodoPanel({ todos, text, onTextChange, onAdd, onToggle, onDelete, syncStatus }) {
+  const completed = todos.filter((todo) => todo.completed).length;
+  const progress = todos.length ? Math.round((completed / todos.length) * 100) : 0;
+  const statusLabel = {
+    checking: "Checking…",
+    saving: "Saving…",
+    synced: "Synced",
+    local: "On device",
+    error: "Not saved",
+  }[syncStatus];
+
+  return (
+    <aside className="todo-panel fade-in no-print" style={{ background: "white", border: `1px solid ${COLORS.lavender}`, borderRadius: 18, padding: 18, boxShadow: "0 8px 24px rgba(54,11,92,0.08)" }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 10 }}>
+        <div>
+          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+            <div style={{ width: 34, height: 34, borderRadius: 10, background: COLORS.lavender, color: COLORS.purple, display: "grid", placeItems: "center" }}><ListTodo size={18} /></div>
+            <div>
+              <div className="viga" style={{ fontSize: 17 }}>Today’s priorities</div>
+              <div style={{ fontSize: 11, color: COLORS.slate, marginTop: 1 }}>{completed} of {todos.length} completed</div>
+            </div>
+          </div>
+        </div>
+        <span style={{ fontSize: 9, fontWeight: 700, color: syncStatus === "synced" ? "#25613B" : COLORS.slate, background: syncStatus === "synced" ? "#EAF7EF" : COLORS.lavender, borderRadius: 999, padding: "4px 7px", whiteSpace: "nowrap" }}>{statusLabel}</span>
+      </div>
+
+      <div style={{ height: 6, borderRadius: 999, background: COLORS.lavender, overflow: "hidden", marginTop: 14 }}>
+        <div style={{ width: `${progress}%`, height: "100%", background: COLORS.purple, borderRadius: 999, transition: "width .2s ease" }} />
+      </div>
+
+      <div style={{ display: "flex", gap: 7, marginTop: 14 }}>
+        <input
+          aria-label="New to-do"
+          value={text}
+          onChange={(event) => onTextChange(event.target.value)}
+          onKeyDown={(event) => event.key === "Enter" && onAdd()}
+          placeholder="Add a task…"
+          style={{ minWidth: 0, flex: 1, height: 39, border: `1px solid ${COLORS.mauve}`, borderRadius: 10, padding: "0 10px", color: COLORS.purple, fontSize: 12 }}
+        />
+        <button aria-label="Add task" onClick={onAdd} disabled={!text.trim()} style={{ width: 39, height: 39, border: "none", borderRadius: 10, background: COLORS.purple, color: "white", display: "grid", placeItems: "center" }}><Plus size={17} /></button>
+      </div>
+
+      <div style={{ display: "flex", flexDirection: "column", gap: 7, marginTop: 14, maxHeight: 420, overflowY: "auto" }}>
+        {todos.length === 0 && (
+          <div style={{ textAlign: "center", color: COLORS.slate, background: "#FBF9FD", borderRadius: 11, padding: "18px 10px", fontSize: 12, lineHeight: 1.45 }}>
+            Add the tasks you want to complete today.
+          </div>
+        )}
+        {todos.map((todo) => (
+          <div key={todo.id} style={{ display: "flex", alignItems: "flex-start", gap: 9, background: todo.completed ? "#F5F1F8" : "#FBF9FD", borderRadius: 11, padding: "9px 8px 9px 9px" }}>
+            <button aria-label={todo.completed ? "Mark task incomplete" : "Mark task complete"} onClick={() => onToggle(todo.id)} style={{ width: 21, height: 21, flex: "0 0 21px", marginTop: 1, border: `1.5px solid ${todo.completed ? COLORS.purple : COLORS.mauve}`, borderRadius: 6, background: todo.completed ? COLORS.purple : "white", color: "white", display: "grid", placeItems: "center", padding: 0 }}>
+              {todo.completed && <Check size={14} strokeWidth={3} />}
+            </button>
+            <div style={{ flex: 1, minWidth: 0, color: todo.completed ? COLORS.slate : COLORS.purple, textDecoration: todo.completed ? "line-through" : "none", fontSize: 12, lineHeight: 1.45, overflowWrap: "anywhere" }}>{todo.text}</div>
+            <button aria-label="Delete task" onClick={() => onDelete(todo.id)} style={{ flex: "0 0 auto", border: "none", background: "transparent", color: COLORS.mauve, padding: 2, display: "grid", placeItems: "center" }}><X size={14} /></button>
+          </div>
+        ))}
+      </div>
+    </aside>
   );
 }
 
