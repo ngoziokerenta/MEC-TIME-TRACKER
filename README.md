@@ -17,6 +17,13 @@ A time-tracking app for clocking in and out, recording breaks, and logging coach
 - Export the selected report as CSV.
 - Use Print / PDF to create a shareable report from the browser.
 
+## Daily priorities
+
+- A desktop side panel keeps the day's to-do list beside the time tracker.
+- Tasks can be added, checked off, reopened, or deleted.
+- Daily completion progress is shown at a glance.
+- Tasks use Firebase when available and retain an on-device recovery copy.
+
 The Firebase variables in `.env.example` must be configured in the deployment environment. Firebase Realtime Database rules must permit the app's intended user to read and write the `entries` path. For multi-user use, add Firebase Authentication and user-scoped database rules before storing staff records.
 
 ## Development
