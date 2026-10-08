@@ -24,6 +24,7 @@ import {
 } from "lucide-react";
 import { initializeApp } from "firebase/app";
 import { getDatabase, ref, get, set } from "firebase/database";
+import { getAuth, signInAnonymously } from "firebase/auth";
 
 const COLORS = {
   purple: "#360B5C",
@@ -58,6 +59,23 @@ const firebaseConfig = {
 const hasFirebaseConfig = Object.values(firebaseConfig).every(Boolean);
 const app = hasFirebaseConfig ? initializeApp(firebaseConfig) : null;
 const database = app ? getDatabase(app) : null;
+const auth = app ? getAuth(app) : null;
+let authPromise = null;
+
+async function ensureFirebaseAuth() {
+  if (!auth) throw new Error("Firebase is not configured");
+  if (auth.currentUser) return auth.currentUser;
+
+  if (!authPromise) {
+    authPromise = signInAnonymously(auth)
+      .then(({ user }) => user)
+      .finally(() => {
+        authPromise = null;
+      });
+  }
+
+  return authPromise;
+}
 
 const LOCAL_STORAGE_PREFIX = "mec-time-log:";
 const LOCAL_META_PREFIX = "mec-time-log-meta:";
@@ -250,6 +268,7 @@ function effectiveEnd(entry, dateKey, currentTime) {
 async function writeDayEntries(day, entriesArr) {
   writeLocalDay(day, entriesArr);
   if (!database) throw new Error("Firebase is not configured");
+  await ensureFirebaseAuth();
   const dbRef = ref(database, `entries/${day}`);
   await set(dbRef, entriesArr);
   markLocalDaySynced(day);
@@ -320,6 +339,7 @@ export default function TimeTracker() {
 
       try {
         if (!database) throw new Error("Firebase is not configured");
+        await ensureFirebaseAuth();
         const dbRef = ref(database, `entries/${dateKey}`);
         const snapshot = await get(dbRef);
         let data = snapshot.exists() ? snapshot.val() : [];
@@ -391,6 +411,7 @@ export default function TimeTracker() {
 
       try {
         if (!database) throw new Error("Firebase is not configured");
+        await ensureFirebaseAuth();
         const snapshot = await get(ref(database, "entries"));
         const cloudValue = snapshot.exists() ? snapshot.val() : {};
         const cloudDays = Object.entries(cloudValue || {}).reduce((days, [day, value]) => {
@@ -424,6 +445,7 @@ export default function TimeTracker() {
 
       try {
         if (!database) throw new Error("Firebase is not configured");
+        await ensureFirebaseAuth();
         const dbRef = ref(database, `todos/${todoDay}`);
         const snapshot = await get(dbRef);
         let data = snapshot.exists() ? snapshot.val() : [];
@@ -459,6 +481,7 @@ export default function TimeTracker() {
       setTodoSyncStatus("saving");
       try {
         if (!database) throw new Error("Firebase is not configured");
+        await ensureFirebaseAuth();
         await set(ref(database, `todos/${todoDay}`), next);
         markLocalTodosSynced(todoDay);
         setTodoSyncStatus("synced");
@@ -503,6 +526,7 @@ export default function TimeTracker() {
       setSyncMessage("");
       try {
         if (!database) throw new Error("Firebase is not configured");
+        await ensureFirebaseAuth();
         const dbRef = ref(database, `entries/${dateKey}`);
         await set(dbRef, next);
         markLocalDaySynced(dateKey);
