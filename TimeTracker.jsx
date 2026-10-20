@@ -613,7 +613,12 @@ export default function TimeTracker() {
       setEntryError("Enter valid start and end times.");
       return;
     }
-    if (todayKey(start) !== dateKey || (end && todayKey(end) !== dateKey)) {
+    // datetime-local values already represent the calendar date the user picked.
+    // Comparing after Date parsing can shift that date when the browser/runtime
+    // applies a timezone offset, which incorrectly rejects valid same-day edits.
+    const startDateKey = entryDraft.start.slice(0, 10);
+    const endDateKey = entryDraft.end ? entryDraft.end.slice(0, 10) : null;
+    if (startDateKey !== dateKey || (endDateKey && endDateKey !== dateKey)) {
       setEntryError("The entry must remain within the selected date.");
       return;
     }
