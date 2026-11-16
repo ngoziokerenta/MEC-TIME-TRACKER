@@ -48,3 +48,8 @@ fieldset{border:0;padding:0;margin:0;min-width:0}.discount-help{font-size:11px;c
 .reference-invoice .document-brand small{-webkit-text-stroke:0;font-family:'MEC Invoice Sans',Arial,sans-serif}
 
 .mec-site-logo{display:inline-flex;align-items:center;gap:10px;text-align:left;color:#322043;letter-spacing:normal;flex-shrink:0}.mec-site-logo .mec-site-mark{display:flex;align-items:center;justify-content:center;width:40px;height:45px;background:#60388c;color:#fff;border-radius:10px 10px 10px 2px;font:700 15px Arial,sans-serif;letter-spacing:-1px}.mec-site-wordmark{display:flex;flex-direction:column;gap:5px}.mec-site-wordmark strong{font:700 17px Arial,sans-serif;white-space:nowrap}.mec-site-logo .mec-site-wordmark small{font:700 9px Arial,sans-serif;letter-spacing:1px;color:#60388c}.document-brand>.mec-site-logo{transform:scale(1.15);transform-origin:left center}
+
+
+/* A real extra-bold face for the issuer and client names in the sample invoice. */
+@font-face{font-family:'MEC Invoice Heavy';src:url('/fonts/mec-invoice-heavy.woff') format('woff');font-style:normal;font-weight:800;font-display:swap}
+.reference-invoice .document-parties h3{font-family:'MEC Invoice Heavy','Arial Black',Arial,sans-serif;font-size:13px;font-weight:800;font-synthesis:none;letter-spacing:0;-webkit-text-stroke:.1px currentColor;color:#360b5c}
