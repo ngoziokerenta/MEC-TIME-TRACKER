@@ -23,9 +23,10 @@ export async function PUT(request:Request){
   if(body.revision!==(record?.value.revision||0))return json({error:'Invoices changed on another device. Reload before saving again.'},409);
   const revision=body.revision+1;
   await writeRecord('finance/records.json',{revision,data:parsed.data},record?.etag||null);
-  return json({revision});
+  return json({revision,data:parsed.data});
  }catch(error){
   if(error instanceof BlobPreconditionFailedError)return json({error:'Invoices changed on another device. Reload before saving again.'},409);
   return json({error:'Invoice changes could not be saved. Your form remains open.'},503);
  }
 }
+
