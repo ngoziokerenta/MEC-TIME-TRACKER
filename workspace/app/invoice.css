@@ -59,7 +59,7 @@ fieldset{border:0;padding:0;margin:0;min-width:0}.discount-help{font-size:11px;c
 .reference-invoice{padding:32px 45.333px 32px;min-height:1122.52px;height:1122.52px;flex-shrink:0;overflow:visible}
 .reference-invoice>.document-brand,.reference-invoice>.document-parties,.reference-invoice>.document-meta,.reference-invoice>.document-items,.reference-invoice>.document-bottom{flex-shrink:0}
 .reference-invoice .document-brand{height:143.5px;min-height:143.5px;position:relative;gap:0}
-.reference-invoice .document-brand img{width:218px;max-width:none;margin-left:24px;margin-top:0}
+.reference-invoice .document-brand img{width:228px;max-width:none;margin-left:23.777px;margin-top:5.11px}
 .reference-invoice .document-brand>div{font-family:'MEC Invoice Heavy','Arial Black',Arial,sans-serif;font-size:42px;font-weight:800;line-height:1.15;letter-spacing:7px;-webkit-text-stroke:.25px currentColor;transform:scaleX(1.04);transform-origin:right top;margin-top:5px;margin-right:-4px}
 .reference-invoice .document-brand small{font-size:10px;line-height:1.4;margin-top:8px;letter-spacing:2px}
 .reference-invoice .document-parties{grid-template-columns:1fr 1fr;gap:13px}
