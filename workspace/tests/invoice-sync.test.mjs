@@ -7,7 +7,7 @@ import ts from 'typescript';
 import React from 'react';
 import {renderToStaticMarkup} from 'react-dom/server';
 import {mergeInvoiceState,saveInvoiceState} from '../lib/invoice-sync.ts';
-import {normalizeInvoice,totals,invoiceStatus} from '../lib/invoice.ts';
+import {normalizeInvoice,totals,invoiceStatus,invoiceDisplayAmounts} from '../lib/invoice.ts';
 
 const invoice={id:'invoice-a',number:'TEST-001',clientId:'test-client',clientName:'Example Client',clientEmail:'',clientAddress:'',vendorNumber:'',date:'2026-11-01',due:'2026-11-10',currency:'NGN',items:[{description:'Example service',qty:1,rate:1000}],discount:100,showDiscount:false,tax:7.5,payments:[],draft:false,notes:'Original notes'};
 const state=()=>({company:{name:'Example business',email:'',address:'',taxId:'',bank:'',account:'',accountName:'',terms:''},numbering:{automatic:true,interval:4},catalog:[],clients:[{id:'test-client',name:'Example Client',email:'',address:''}],invoices:[structuredClone(invoice)],next:5});
@@ -92,4 +92,26 @@ test('actual API handlers save compressed-size records with a strong ETag and pe
  const result=await saveInvoiceState({revision:1,data:base},mine,async(url,options)=>options?.method==='PUT'?api.PUT(new Request('https://example.test/api/state',options)):api.GET());
  assert.equal(result.revision,3);assert.equal(stored.invoices[0].due,'');assert.equal(stored.invoices[0].notes,'Newer saved notes');
  const reread=await (await api.GET()).json();assert.equal(reread.data.invoices[0].due,'');assert.equal(reread.revision,3);
+});
+
+
+test('hidden discount is included in printed item amounts and subtotal without changing VAT or final total',()=>{
+ const sample={...invoice,items:[{description:'Coaching',qty:5,rate:250000}],discount:250000,tax:7.5,showDiscount:false};
+ const before=structuredClone(sample),display=invoiceDisplayAmounts(sample);
+ assert.deepEqual(display.items,[1000000]);assert.equal(display.subtotal,1000000);
+ assert.equal(totals(sample).tax,75000);assert.equal(totals(sample).total,1075000);
+ const hidden=renderToStaticMarkup(React.createElement(InvoiceDocument,{invoice:sample,company:state().company}));
+ assert(hidden.includes('1,000,000.00'));assert(!hidden.includes('1,250,000.00'));assert(!hidden.includes('>Discount<'));assert(hidden.includes('1,075,000.00'));
+ const shown=renderToStaticMarkup(React.createElement(InvoiceDocument,{invoice:{...sample,showDiscount:true},company:state().company}));
+ assert(shown.includes('1,250,000.00'));assert(shown.includes('>Discount<'));assert(shown.includes('1,075,000.00'));
+ assert.deepEqual(sample,before);
+});
+
+test('multiple discounted items add up exactly after cent rounding, including zero-price lines',()=>{
+ const sample={...invoice,items:[{description:'A',qty:1,rate:1},{description:'B',qty:1,rate:1},{description:'C',qty:1,rate:1},{description:'Free',qty:1,rate:0}],discount:1,showDiscount:false,tax:0};
+ const display=invoiceDisplayAmounts(sample);
+ assert.deepEqual(display.items,[0.67,0.67,0.66,0]);assert.equal(display.items.reduce((sum,value)=>sum+Math.round(value*100),0),200);assert.equal(display.subtotal,2);assert.equal(totals(sample).total,2);
+ const legacy={...sample,showDiscount:undefined,includeDiscount:false};assert.deepEqual(invoiceDisplayAmounts(legacy).items,display.items);
+ assert.deepEqual(invoiceDisplayAmounts({...sample,discount:0}).items,[1,1,1,0]);
+ assert.deepEqual(invoiceDisplayAmounts({...sample,discount:3}).items,[0,0,0,0]);
 });
