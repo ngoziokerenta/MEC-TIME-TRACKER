@@ -2,7 +2,10 @@ import {get,put,BlobPreconditionFailedError} from '@vercel/blob';
 export {BlobPreconditionFailedError};
 const prefix=process.env.VERCEL_ENV==='production'?'':'preview/';
 export async function readRecord(name:string){
- const result=await get(prefix+name,{access:'private',useCache:false});
+ // Compressed Blob responses carry weak HTTP ETags (W/"..."). Blob's
+ // conditional write API requires the strong stored ETag. Read the identity
+ // representation so the body and write precondition describe the same version.
+ const result=await get(prefix+name,{access:'private',useCache:false,headers:{'Accept-Encoding':'identity'}});
  if(!result)return null;
  if(result.statusCode!==200||!result.stream)throw Error('Unable to read records');
  return {value:await new Response(result.stream).json(),etag:result.blob.etag};
@@ -16,3 +19,4 @@ export function trustedWrite(request:Request){
  const origin=request.headers.get('origin');
  try{return !origin||new URL(origin).host===request.headers.get('host')}catch{return false}
 }
+

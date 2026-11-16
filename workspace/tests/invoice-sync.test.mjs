@@ -76,18 +76,18 @@ test('an empty due date saves as empty, has no overdue status, and is omitted fr
  assert.equal(cleared.due,'');assert.equal(invoiceStatus(cleared,'2026-12-01'),'Unpaid');
  assert.equal(totals(cleared).total,967.5);
  const html=renderToStaticMarkup(React.createElement(InvoiceDocument,{invoice:cleared,company:state().company}));
- assert(!html.includes('DUE DATE'));assert(!html.includes('>Discount<'));assert(html.includes('TOTAL PAYABLE'));
+ assert(!html.includes('DUE DATE'));assert(!html.includes('>Discount<'));assert(html.includes('TOTAL PAYABLE'));assert(html.includes('/mec-logo.png'));assert(!html.includes('mec-site-mark'));
 });
 
 let stored=state(),revision=2,etag=1;
 stored=change(stored,{notes:'Newer saved notes'});
 class Conflict extends Error{}
 mock.module('@vercel/blob',{namedExports:{BlobPreconditionFailedError:Conflict,
- get:async(path,options)=>{assert.equal(options.access,'private');assert.equal(options.useCache,false);if(path.endsWith('workspace/records.json'))return null;return {statusCode:200,stream:new Blob([JSON.stringify({revision,data:stored})]).stream(),blob:{etag:String(etag)}};},
+ get:async(path,options)=>{assert.equal(options.access,'private');assert.equal(options.useCache,false);if(path.endsWith('workspace/records.json'))return null;return {statusCode:200,stream:new Blob([JSON.stringify({revision,data:stored})]).stream(),blob:{etag:options.headers?.['Accept-Encoding']==='identity'?String(etag):'W/'+String(etag)}};},
  put:async(path,body,options)=>{assert.equal(options.access,'private');if(options.ifMatch!==String(etag))throw new Conflict();const next=JSON.parse(body);stored=next.data;revision=next.revision;etag++;return {etag:String(etag)};}
 }});
 const api=await import(pathToFileURL(join(temporary,'route.mjs')));
-test('actual API handlers accept the rebased clear and persist it with the updated revision',async()=>{
+test('actual API handlers save compressed-size records with a strong ETag and persist a cleared due date',async()=>{
  const base=state(),mine=change(base,{due:''});
  const result=await saveInvoiceState({revision:1,data:base},mine,async(url,options)=>options?.method==='PUT'?api.PUT(new Request('https://example.test/api/state',options)):api.GET());
  assert.equal(result.revision,3);assert.equal(stored.invoices[0].due,'');assert.equal(stored.invoices[0].notes,'Newer saved notes');
